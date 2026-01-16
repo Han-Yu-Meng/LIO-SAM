@@ -309,25 +309,72 @@ public:
         std::lock_guard<std::mutex> lock(mtx);
 
         static double timeLastProcessing = -1;
+
+        logger->infof("Handler: Corner Size %zu, Surf Size %zu", laserCloudCornerLast->size(), laserCloudSurfLast->size());
+
         if (timeLaserInfoCur - timeLastProcessing >= mappingProcessInterval)
         {
             timeLastProcessing = timeLaserInfoCur;
 
-            updateInitialGuess();
+            logger->infof("--- Start Processing Frame ---");
 
-            extractSurroundingKeyFrames();
+            {
+                FINS_TIME_BLOCK(logger, "updateInitialGuess");
+                updateInitialGuess();
+            }
 
-            downsampleCurrentScan();
+            logger->infof("1. Initial Guess: [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f]", 
+                          transformTobeMapped[0], transformTobeMapped[1], transformTobeMapped[2],
+                          transformTobeMapped[3], transformTobeMapped[4], transformTobeMapped[5]);
 
-            scan2MapOptimization();
+            {
+                FINS_TIME_BLOCK(logger, "Extract Surrounding Key Frames");
+                extractSurroundingKeyFrames();
+            }
 
-            saveKeyFramesAndFactor();
+            logger->infof("2. Surrounding Key Frames Extracted");
 
-            correctPoses();
+            {
+                FINS_TIME_BLOCK(logger, "downsampleCurrentScan");
+                downsampleCurrentScan();
+            }
 
-            publishOdometry(msgIn.event_time);
+            logger->infof("3. Current Scan Downsampled: Corner %d, Surf %d", laserCloudCornerLastDSNum, laserCloudSurfLastDSNum);
 
-            publishFrames(msgIn.event_time);
+            {
+                FINS_TIME_BLOCK(logger, "scan2MapOptimization");
+                scan2MapOptimization();
+            }
+
+            logger->infof("4. Scan-to-Map Optimization Done");
+
+            {
+                FINS_TIME_BLOCK(logger, "saveKeyFramesAndFactor");
+                saveKeyFramesAndFactor();
+            }
+
+            logger->infof("5. Key Frames and Factors Saved");
+
+            {
+                FINS_TIME_BLOCK(logger, "correctPoses");
+                correctPoses();
+            }
+
+            logger->infof("6. Poses Corrected");
+
+            {
+                FINS_TIME_BLOCK(logger, "publishOdometry");
+                publishOdometry(msgIn.event_time);
+            }
+
+            logger->infof("7. Odometry Published");
+
+            {
+                FINS_TIME_BLOCK(logger, "publishFrames");
+                publishFrames(msgIn.event_time);
+            }
+
+            logger->infof("--- Frame Processing Complete ---");
         }
     }
 
@@ -501,7 +548,7 @@ public:
         {
             if (isLoopRunning) {
                 performLoopClosure();
-                visualizeLoopClosure();
+                // visualizeLoopClosure();
             }
 
             std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -1270,7 +1317,7 @@ public:
 
             transformUpdate();
         } else {
-            logger->warn("Not enough features! Only %d edge and %d planar features available.", laserCloudCornerLastDSNum, laserCloudSurfLastDSNum);
+            logger->warnf("Not enough features! Only %d edge and %d planar features available.", laserCloudCornerLastDSNum, laserCloudSurfLastDSNum);
         }
     }
 
@@ -1696,8 +1743,21 @@ public:
         globalPath.header.frame_id = odometryFrame;
         send<3>(globalPath, ts);
 
+        // cloud_registered
+        pcl::PointCloud<PointType>::Ptr cloudOut(new pcl::PointCloud<PointType>());
+        PointTypePose thisPose6D = trans2PointTypePose(transformTobeMapped);
+        
+        *cloudOut += *transformPointCloud(laserCloudCornerLastDS,  &thisPose6D);
+        *cloudOut += *transformPointCloud(laserCloudSurfLastDS,    &thisPose6D);
+        
+        pcl::toROSMsg(*cloudOut, rosCloud);
+        rosCloud.header.stamp = timeLaserInfoStamp;
+        rosCloud.header.frame_id = odometryFrame;
+        
+        send<4>(rosCloud, ts); 
+
         // Global Map (Optional: Can be slow, typically triggered by timer or specific logic)
-        publishGlobalMap(ts);
+        // publishGlobalMap(ts);
     }
 };
 

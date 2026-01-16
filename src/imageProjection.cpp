@@ -41,7 +41,7 @@ class ImageProjection : public ParamServer
 {
 public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-    
+
     void define() override {
         set_name("ImageProjection");
         set_description("Project LIDAR point cloud into range image");
@@ -192,21 +192,32 @@ public:
         odomQueue.push_back(*msg.data);
     }
 
-    void cloudHandler(const fins::Msg<sensor_msgs::msg::PointCloud2> &msg)
+void cloudHandler(const fins::Msg<sensor_msgs::msg::PointCloud2> &msg)
     {
         sensor_msgs::msg::PointCloud2 laserCloudMsg = *msg.data;
-        if (!cachePointCloud(laserCloudMsg))
-            return;
+        
+        // DEBUG 1
+        logger->infof("Received Cloud: time=%.4f", stamp2Sec(laserCloudMsg.header.stamp));
 
-        if (!deskewInfo())
+        if (!cachePointCloud(laserCloudMsg)) {
+            logger->warnf("Failed at cachePointCloud (queue size: %zu)", cloudQueue.size());
             return;
+        }
+
+        if (!deskewInfo()) {
+            logger->warn("Failed at deskewInfo (IMU sync issue)");
+            return;
+        }
 
         projectPointCloud();
+        
+        logger->infof("Projected cloud size: %zu", fullCloud->points.size());
 
         cloudExtraction();
 
-        publishClouds();
+        logger->infof("Extracted cloud size: %zu", extractedCloud->size());
 
+        publishClouds();
         resetParameters();
     }
 
@@ -305,22 +316,31 @@ public:
         return true;
     }
 
-    bool deskewInfo()
+bool deskewInfo()
     {
         std::lock_guard<std::mutex> lock1(imuLock);
         std::lock_guard<std::mutex> lock2(odoLock);
 
-        // make sure IMU data available for the scan
+        if (imuQueue.empty()) {
+            logger->warn("IMU Queue Empty");
+            return false;
+        }
+
+        double imu_front = stamp2Sec(imuQueue.front().header.stamp);
+        double imu_back = stamp2Sec(imuQueue.back().header.stamp);
+
+        logger->infof("Scan Time: [%.4f, %.4f], IMU Time: [%.4f, %.4f]", 
+                     timeScanCur, timeScanEnd, imu_front, imu_back);
+
         if (imuQueue.empty() ||
-            stamp2Sec(imuQueue.front().header.stamp) > timeScanCur ||
-            stamp2Sec(imuQueue.back().header.stamp) < timeScanEnd)
+            imu_front > timeScanCur ||
+            imu_back < timeScanEnd)
         {
             logger->info("Waiting for IMU data ...");
             return false;
         }
 
         imuDeskewInfo();
-
         odomDeskewInfo();
 
         return true;
