@@ -1,113 +1,94 @@
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.16)
 project(lio_sam)
 
-if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
-  set(CMAKE_BUILD_TYPE Release)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+add_definitions(-DBOOST_BIND_GLOBAL_PLACEHOLDERS)
+add_definitions(-DBOOST_ALLOW_DEPRECATED_HEADERS)
+
+add_compile_options(
+    -Wno-reorder
+    -Wno-unused-parameter
+    -Wno-unused-variable
+    -Wno-unused-but-set-variable
+    -Wno-sign-compare 
+    -Wno-deprecated-declarations
+    -Wno-comment
+    -Wno-switch
+    -Wno-maybe-uninitialized 
+)
+
+if(NOT MSVC)
+    add_compile_options(-fexceptions -pthread)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm|aarch64|ARM|AARCH64)")
+        add_compile_options(-O3 -mcpu=native -mtune=native -ffast-math)
+        add_definitions(-DARM_ARCH)
+    else()
+        add_compile_options(-O3 -march=native -mtune=native -funroll-loops)
+        add_definitions(-DX86_ARCH)
+    endif()
 endif()
 
-
-# find dependencies
-find_package(ament_cmake REQUIRED)
-find_package(rosidl_default_generators REQUIRED)
-find_package(rclcpp REQUIRED)
-find_package(rclpy REQUIRED)
-find_package(cv_bridge REQUIRED)
-find_package(std_msgs REQUIRED)
-find_package(sensor_msgs REQUIRED)
-find_package(geometry_msgs REQUIRED)
-find_package(nav_msgs REQUIRED)
-find_package(visualization_msgs REQUIRED)
-find_package(pcl_conversions REQUIRED)
-find_package(pcl_msgs REQUIRED)
-find_package(tf2 REQUIRED)
-find_package(tf2_geometry_msgs REQUIRED)
-find_package(tf2_sensor_msgs REQUIRED)
-find_package(tf2_eigen REQUIRED)
-find_package(tf2_ros REQUIRED)
-set(OpenCV_STATIC ON)
-find_package(OpenCV REQUIRED)
+find_package(Eigen3 REQUIRED)
 find_package(PCL REQUIRED)
+find_package(OpenCV REQUIRED)
 find_package(GTSAM REQUIRED)
-find_package(Eigen REQUIRED)
 find_package(OpenMP REQUIRED)
 
-include_directories(
-  include/lio_sam
+find_package(rclcpp QUIET)
+
+set(ROS_MSG_PKGS
+    std_msgs
+    sensor_msgs
+    geometry_msgs
+    nav_msgs
+    visualization_msgs
+    pcl_conversions
+    tf2
+    tf2_ros
+    tf2_geometry_msgs 
+    tf2_eigen
 )
 
-rosidl_generate_interfaces(${PROJECT_NAME} "msg/CloudInfo.msg" "srv/SaveMap.srv" DEPENDENCIES std_msgs sensor_msgs)
+foreach(pkg ${ROS_MSG_PKGS})
+    find_package(${pkg} REQUIRED)
+endforeach()
 
-
-
-add_executable(${PROJECT_NAME}_featureExtraction src/featureExtraction.cpp)
-ament_target_dependencies(${PROJECT_NAME}_featureExtraction rclcpp rclpy std_msgs sensor_msgs geometry_msgs nav_msgs pcl_conversions pcl_msgs visualization_msgs tf2 tf2_ros tf2_eigen tf2_sensor_msgs tf2_geometry_msgs OpenCV PCL)
-rosidl_get_typesupport_target(cpp_typesupport_target ${PROJECT_NAME} "rosidl_typesupport_cpp")
-target_link_libraries(${PROJECT_NAME}_featureExtraction "${cpp_typesupport_target}") 
-
-add_executable(${PROJECT_NAME}_imageProjection src/imageProjection.cpp)
-ament_target_dependencies(${PROJECT_NAME}_imageProjection rclcpp rclpy std_msgs sensor_msgs geometry_msgs nav_msgs pcl_conversions pcl_msgs visualization_msgs tf2 tf2_ros tf2_eigen tf2_sensor_msgs tf2_geometry_msgs OpenCV PCL)
-target_link_libraries(${PROJECT_NAME}_imageProjection "${cpp_typesupport_target}") 
-
-add_executable(${PROJECT_NAME}_imuPreintegration src/imuPreintegration.cpp)
-ament_target_dependencies(${PROJECT_NAME}_imuPreintegration rclcpp rclpy std_msgs sensor_msgs geometry_msgs nav_msgs pcl_conversions pcl_msgs visualization_msgs tf2 tf2_ros tf2_eigen tf2_sensor_msgs tf2_geometry_msgs OpenCV PCL GTSAM Eigen)
-target_link_libraries(${PROJECT_NAME}_imuPreintegration gtsam "${cpp_typesupport_target}")
-
-add_executable(${PROJECT_NAME}_mapOptimization src/mapOptmization.cpp)
-ament_target_dependencies(${PROJECT_NAME}_mapOptimization rclcpp rclpy std_msgs sensor_msgs geometry_msgs nav_msgs pcl_conversions pcl_msgs visualization_msgs tf2 tf2_ros tf2_eigen tf2_sensor_msgs tf2_geometry_msgs OpenCV PCL GTSAM)
-if (OpenMP_CXX_FOUND)
-  target_link_libraries(${PROJECT_NAME}_mapOptimization gtsam "${cpp_typesupport_target}" OpenMP::OpenMP_CXX)
-else()
-  target_link_libraries(${PROJECT_NAME}_mapOptimization gtsam "${cpp_typesupport_target}")
+include(ProcessorCount)
+ProcessorCount(N)
+if(N GREATER 1)
+  add_definitions(-DMP_EN -DMP_PROC_NUM=${N})
 endif()
 
+add_library(${PROJECT_NAME} SHARED src/nodes.cpp)
 
-install(
-  DIRECTORY launch
-  DESTINATION share/${PROJECT_NAME}/
+target_include_directories(${PROJECT_NAME} PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/lio_sam>
+    ${EIGEN3_INCLUDE_DIR}
+    ${PCL_INCLUDE_DIRS}
+    ${OpenCV_INCLUDE_DIRS}
+    ${GTSAM_INCLUDE_DIR}
 )
 
-install(
-  DIRECTORY config
-  DESTINATION share/${PROJECT_NAME}/
+target_link_libraries(${PROJECT_NAME} PRIVATE 
+    fins_sdk
+    gtsam
+    OpenMP::OpenMP_CXX
+    ${PCL_LIBRARIES}
+    ${OpenCV_LIBRARIES}
 )
 
-install(
-  TARGETS ${PROJECT_NAME}_imageProjection
-  DESTINATION lib/${PROJECT_NAME}
-)
-
-install(
-  TARGETS ${PROJECT_NAME}_imuPreintegration
-  DESTINATION lib/${PROJECT_NAME}
-)
-
-install(
-  TARGETS ${PROJECT_NAME}_featureExtraction
-  DESTINATION lib/${PROJECT_NAME}
-)
-
-install(
-  TARGETS ${PROJECT_NAME}_mapOptimization
-  DESTINATION lib/${PROJECT_NAME}
-)
-
-install(
-  DIRECTORY "include/"
-  DESTINATION include
-)
-
-ament_export_include_directories(include)
-
-if(BUILD_TESTING)
-  find_package(ament_lint_auto REQUIRED)
-  # the following line skips the linter which checks for copyrights
-  # uncomment the line when a copyright and license is not present in all source files
-  #set(ament_cmake_copyright_FOUND TRUE)
-  # the following line skips cpplint (only works in a git repo)
-  # uncomment the line when this package is not in a git repo
-  #set(ament_cmake_cpplint_FOUND TRUE)
-  ament_lint_auto_find_test_dependencies()
-endif()
-
-ament_package()
+foreach(pkg ${ROS_MSG_PKGS})
+    if(TARGET ${pkg}::${pkg}__rosidl_generator_cpp)
+        target_link_libraries(${PROJECT_NAME} PRIVATE ${pkg}::${pkg}__rosidl_generator_cpp)
+    
+    elseif(TARGET ${pkg}::${pkg})
+        target_link_libraries(${PROJECT_NAME} PRIVATE ${pkg}::${pkg})
+    
+    else()
+        target_include_directories(${PROJECT_NAME} PRIVATE ${${pkg}_INCLUDE_DIRS})
+        target_link_libraries(${PROJECT_NAME} PRIVATE ${${pkg}_LIBRARIES})
+    endif()
+endforeach()
 

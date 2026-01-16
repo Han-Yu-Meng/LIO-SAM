@@ -1,6 +1,7 @@
+#pragma once
+
 #include "utility.hpp"
-#include "lio_sam/msg/cloud_info.hpp"
-#include "lio_sam/srv/save_map.hpp"
+
 #include <gtsam/geometry/Rot3.h>
 #include <gtsam/geometry/Pose3.h>
 #include <gtsam/slam/PriorFactor.h>
@@ -58,24 +59,6 @@ public:
     ISAM2 *isam;
     Values isamCurrentEstimate;
     Eigen::MatrixXd poseCovariance;
-
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudSurround;
-    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubLaserOdometryGlobal;
-    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubLaserOdometryIncremental;
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubKeyPoses;
-    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath;
-
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubHistoryKeyFrames;
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubIcpKeyFrames;
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubRecentKeyFrames;
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubRecentKeyFrame;
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubCloudRegisteredRaw;
-    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pubLoopConstraintEdge;
-
-    rclcpp::Service<lio_sam::srv::SaveMap>::SharedPtr srvSaveMap;
-    rclcpp::Subscription<lio_sam::msg::CloudInfo>::SharedPtr subCloud;
-    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr subGPS;
-    rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr subLoop;
 
     std::deque<nav_msgs::msg::Odometry> gpsQueue;
     lio_sam::msg::CloudInfo cloudInfo;
@@ -149,107 +132,104 @@ public:
     Eigen::Affine3f incrementalOdometryAffineFront;
     Eigen::Affine3f incrementalOdometryAffineBack;
 
-    std::unique_ptr<tf2_ros::TransformBroadcaster> br;
+    std::thread loopThread;
 
-    mapOptimization(const rclcpp::NodeOptions & options) : ParamServer("lio_sam_mapOptimization", options)
-    {
+    void define() override {
+        set_name("MapOptimization");
+        set_description("LIO-SAM map optimization and factor graph management");
+        set_category("SLAM>LIO-SAM");
+
+        // Inputs
+        register_input<0, lio_sam::msg::CloudInfo>("cloud_info", &mapOptimization::laserCloudInfoHandler);
+        register_input<1, nav_msgs::msg::Odometry>("gps_odom", &mapOptimization::gpsHandler);
+        register_input<2, std_msgs::msg::Float64MultiArray>("loop_info", &mapOptimization::loopInfoHandler);
+
+        // Outputs
+        register_output<0, nav_msgs::msg::Odometry>("odom_global");
+        register_output<1, nav_msgs::msg::Odometry>("odom_incremental");
+        register_output<2, sensor_msgs::msg::PointCloud2>("key_poses");
+        register_output<3, nav_msgs::msg::Path>("path");
+        register_output<4, sensor_msgs::msg::PointCloud2>("cloud_registered");
+        register_output<5, visualization_msgs::msg::MarkerArray>("loop");
+        register_output<6, sensor_msgs::msg::PointCloud2>("map_local");
+        register_output<7, sensor_msgs::msg::PointCloud2>("map_global");
+        register_output<8, geometry_msgs::msg::TransformStamped>("tf");
+    }
+
+private:
+    std::atomic<bool> isLoopRunning{false};
+    std::atomic<bool> stopThread{false};
+
+public:
+    void initialize() override {
+        ParamServer::initialize();
+
         ISAM2Params parameters;
         parameters.relinearizeThreshold = 0.1;
         parameters.relinearizeSkip = 1;
         isam = new ISAM2(parameters);
 
-        pubKeyPoses = create_publisher<sensor_msgs::msg::PointCloud2>("lio_sam/mapping/trajectory", 1);
-        pubLaserCloudSurround = create_publisher<sensor_msgs::msg::PointCloud2>("lio_sam/mapping/map_global", 1);
-        pubLaserOdometryGlobal = create_publisher<nav_msgs::msg::Odometry>("lio_sam/mapping/odometry", qos);
-        pubLaserOdometryIncremental = create_publisher<nav_msgs::msg::Odometry>(
-            "lio_sam/mapping/odometry_incremental", qos);
-        pubPath = create_publisher<nav_msgs::msg::Path>("lio_sam/mapping/path", 1);
-        br = std::make_unique<tf2_ros::TransformBroadcaster>(this);
-
-        subCloud = create_subscription<lio_sam::msg::CloudInfo>(
-            "lio_sam/feature/cloud_info", qos,
-            std::bind(&mapOptimization::laserCloudInfoHandler, this, std::placeholders::_1));
-        subGPS = create_subscription<nav_msgs::msg::Odometry>(
-            gpsTopic, 200,
-            std::bind(&mapOptimization::gpsHandler, this, std::placeholders::_1));
-        subLoop = create_subscription<std_msgs::msg::Float64MultiArray>(
-            "lio_loop/loop_closure_detection", qos,
-            std::bind(&mapOptimization::loopInfoHandler, this, std::placeholders::_1));
-
-        auto saveMapService = [this](const std::shared_ptr<rmw_request_id_t> request_header, const std::shared_ptr<lio_sam::srv::SaveMap::Request> req, std::shared_ptr<lio_sam::srv::SaveMap::Response> res) -> void {
-            (void)request_header;
-            string saveMapDirectory;
-            cout << "****************************************************" << endl;
-            cout << "Saving map to pcd files ..." << endl;
-            if(req->destination.empty()) saveMapDirectory = std::getenv("HOME") + savePCDDirectory;
-            else saveMapDirectory = std::getenv("HOME") + req->destination;
-            cout << "Save destination: " << saveMapDirectory << endl;
-            // create directory and remove old files;
-            int unused = system((std::string("exec rm -r ") + saveMapDirectory).c_str());
-            unused = system((std::string("mkdir -p ") + saveMapDirectory).c_str());
-            // save key frame transformations
-            pcl::io::savePCDFileBinary(saveMapDirectory + "/trajectory.pcd", *cloudKeyPoses3D);
-            pcl::io::savePCDFileBinary(saveMapDirectory + "/transformations.pcd", *cloudKeyPoses6D);
-            // extract global point cloud map
-            pcl::PointCloud<PointType>::Ptr globalCornerCloud(new pcl::PointCloud<PointType>());
-            pcl::PointCloud<PointType>::Ptr globalCornerCloudDS(new pcl::PointCloud<PointType>());
-            pcl::PointCloud<PointType>::Ptr globalSurfCloud(new pcl::PointCloud<PointType>());
-            pcl::PointCloud<PointType>::Ptr globalSurfCloudDS(new pcl::PointCloud<PointType>());
-            pcl::PointCloud<PointType>::Ptr globalMapCloud(new pcl::PointCloud<PointType>());
-            for (int i = 0; i < (int)cloudKeyPoses3D->size(); i++) 
-            {
-                *globalCornerCloud += *transformPointCloud(cornerCloudKeyFrames[i],  &cloudKeyPoses6D->points[i]);
-                *globalSurfCloud   += *transformPointCloud(surfCloudKeyFrames[i],    &cloudKeyPoses6D->points[i]);
-                cout << "\r" << std::flush << "Processing feature cloud " << i << " of " << cloudKeyPoses6D->size() << " ...";
-            }
-            if(req->resolution != 0)
-            {
-               cout << "\n\nSave resolution: " << req->resolution << endl;
-               // down-sample and save corner cloud
-               downSizeFilterCorner.setInputCloud(globalCornerCloud);
-               downSizeFilterCorner.setLeafSize(req->resolution, req->resolution, req->resolution);
-               downSizeFilterCorner.filter(*globalCornerCloudDS);
-               pcl::io::savePCDFileBinary(saveMapDirectory + "/CornerMap.pcd", *globalCornerCloudDS);
-               // down-sample and save surf cloud
-               downSizeFilterSurf.setInputCloud(globalSurfCloud);
-               downSizeFilterSurf.setLeafSize(req->resolution, req->resolution, req->resolution);
-               downSizeFilterSurf.filter(*globalSurfCloudDS);
-               pcl::io::savePCDFileBinary(saveMapDirectory + "/SurfMap.pcd", *globalSurfCloudDS);
-            }
-            else
-            {
-            // save corner cloud
-               pcl::io::savePCDFileBinary(saveMapDirectory + "/CornerMap.pcd", *globalCornerCloud);
-               // save surf cloud
-               pcl::io::savePCDFileBinary(saveMapDirectory + "/SurfMap.pcd", *globalSurfCloud);
-            }
-            // save global point cloud map
-            *globalMapCloud += *globalCornerCloud;
-            *globalMapCloud += *globalSurfCloud;
-            int ret = pcl::io::savePCDFileBinary(saveMapDirectory + "/GlobalMap.pcd", *globalMapCloud);
-            res->success = ret == 0;
-            downSizeFilterCorner.setLeafSize(mappingCornerLeafSize, mappingCornerLeafSize, mappingCornerLeafSize);
-            downSizeFilterSurf.setLeafSize(mappingSurfLeafSize, mappingSurfLeafSize, mappingSurfLeafSize);
-            cout << "****************************************************" << endl;
-            cout << "Saving map to pcd files completed\n" << endl;
-            return;
-        };
-        
-        srvSaveMap = create_service<lio_sam::srv::SaveMap>("lio_sam/save_map", saveMapService);
-        pubHistoryKeyFrames = create_publisher<sensor_msgs::msg::PointCloud2>("lio_sam/mapping/icp_loop_closure_history_cloud", 1);
-        pubIcpKeyFrames = create_publisher<sensor_msgs::msg::PointCloud2>("lio_sam/mapping/icp_loop_closure_history_cloud", 1);
-        pubLoopConstraintEdge = create_publisher<visualization_msgs::msg::MarkerArray>("/lio_sam/mapping/loop_closure_constraints", 1);
-
-        pubRecentKeyFrames = create_publisher<sensor_msgs::msg::PointCloud2>("lio_sam/mapping/map_local", 1);
-        pubRecentKeyFrame = create_publisher<sensor_msgs::msg::PointCloud2>("lio_sam/mapping/cloud_registered", 1);
-        pubCloudRegisteredRaw = create_publisher<sensor_msgs::msg::PointCloud2>("lio_sam/mapping/cloud_registered_raw", 1);
-
         downSizeFilterCorner.setLeafSize(mappingCornerLeafSize, mappingCornerLeafSize, mappingCornerLeafSize);
         downSizeFilterSurf.setLeafSize(mappingSurfLeafSize, mappingSurfLeafSize, mappingSurfLeafSize);
         downSizeFilterICP.setLeafSize(mappingSurfLeafSize, mappingSurfLeafSize, mappingSurfLeafSize);
-        downSizeFilterSurroundingKeyPoses.setLeafSize(surroundingKeyframeDensity, surroundingKeyframeDensity, surroundingKeyframeDensity); // for surrounding key poses of scan-to-map optimization
+        downSizeFilterSurroundingKeyPoses.setLeafSize(surroundingKeyframeDensity, surroundingKeyframeDensity, surroundingKeyframeDensity); 
 
         allocateMemory();
+        stopThread = false;
+        isLoopRunning = false;
+        if (!loopThread.joinable()) {
+            loopThread = std::thread(&mapOptimization::loopClosureThread, this);
+        }
+    }
+
+    void run() override {
+        isLoopRunning = true;
+        logger->info("Map Optimization Loop Closure Started.");
+    }
+
+    void pause() override {
+        isLoopRunning = false;
+        logger->info("Map Optimization Loop Closure Paused.");
+    }
+
+    void reset() override {
+        std::lock_guard<std::mutex> lock(mtx);
+        gtSAMgraph.resize(0);
+        initialEstimate.clear();
+        optimizedEstimate.clear();
+        isamCurrentEstimate.clear();
+        poseCovariance.resize(0,0);
+        laserCloudMapContainer.clear();
+        cloudKeyPoses3D->clear();
+        cloudKeyPoses6D->clear();
+        copy_cloudKeyPoses3D->clear();
+        copy_cloudKeyPoses6D->clear();
+        cornerCloudKeyFrames.clear();
+        surfCloudKeyFrames.clear();
+        laserCloudCornerLast->clear();
+        laserCloudSurfLast->clear();
+        laserCloudCornerLastDS->clear();
+        laserCloudSurfLastDS->clear();
+        laserCloudOri->clear();
+        coeffSel->clear();
+        laserCloudMapContainer.clear();
+        aLoopIsClosed = false;
+        loopIndexContainer.clear();
+        loopIndexQueue.clear();
+        loopPoseQueue.clear();
+        loopNoiseQueue.clear();
+        loopInfoVec.clear();
+        globalPath.poses.clear();
+        for (int i = 0; i < 6; ++i){
+            transformTobeMapped[i] = 0;
+        }
+        isDegenerate = false;
+        matP.setZero();
+    }
+
+    ~mapOptimization() {
+        if (loopThread.joinable())
+            loopThread.join();
     }
 
     void allocateMemory()
@@ -295,16 +275,16 @@ public:
         matP.setZero();
     }
 
-    void laserCloudInfoHandler(const lio_sam::msg::CloudInfo::SharedPtr msgIn)
+    void laserCloudInfoHandler(const fins::Msg<lio_sam::msg::CloudInfo> &msgIn)
     {
         // extract time stamp
-        timeLaserInfoStamp = msgIn->header.stamp;
-        timeLaserInfoCur = stamp2Sec(msgIn->header.stamp);
+        timeLaserInfoStamp = msgIn.data->header.stamp;
+        timeLaserInfoCur = stamp2Sec(msgIn.data->header.stamp);
 
         // extract info and feature cloud
-        cloudInfo = *msgIn;
-        pcl::fromROSMsg(msgIn->cloud_corner,  *laserCloudCornerLast);
-        pcl::fromROSMsg(msgIn->cloud_surface, *laserCloudSurfLast);
+        cloudInfo = *msgIn.data;
+        pcl::fromROSMsg(msgIn.data->cloud_corner,  *laserCloudCornerLast);
+        pcl::fromROSMsg(msgIn.data->cloud_surface, *laserCloudSurfLast);
 
         std::lock_guard<std::mutex> lock(mtx);
 
@@ -325,15 +305,15 @@ public:
 
             correctPoses();
 
-            publishOdometry();
+            publishOdometry(msgIn.event_time);
 
-            publishFrames();
+            publishFrames(msgIn.event_time);
         }
     }
 
-    void gpsHandler(const nav_msgs::msg::Odometry::SharedPtr gpsMsg)
+    void gpsHandler(const fins::Msg<nav_msgs::msg::Odometry> &gpsMsg)
     {
-        gpsQueue.push_back(*gpsMsg);
+        gpsQueue.push_back(*gpsMsg.data);
     }
 
     void pointAssociateToMap(PointType const * const pi, PointType * const po)
@@ -399,50 +379,47 @@ public:
         return thisPose6D;
     }
 
-    void visualizeGlobalMapThread()
-    {
-        rclcpp::Rate rate(0.2);
-        while (rclcpp::ok()){
-            rate.sleep();
-            publishGlobalMap();
-        }
-        if (savePCD == false)
-            return;
-        cout << "****************************************************" << endl;
-        cout << "Saving map to pcd files ..." << endl;
-        savePCDDirectory = std::getenv("HOME") + savePCDDirectory;
-        int unused = system((std::string("exec rm -r ") + savePCDDirectory).c_str());
-        unused = system((std::string("mkdir ") + savePCDDirectory).c_str());
-        pcl::io::savePCDFileASCII(savePCDDirectory + "trajectory.pcd", *cloudKeyPoses3D);
-        pcl::io::savePCDFileASCII(savePCDDirectory + "transformations.pcd", *cloudKeyPoses6D);
-        pcl::PointCloud<PointType>::Ptr globalCornerCloud(new pcl::PointCloud<PointType>());
-        pcl::PointCloud<PointType>::Ptr globalCornerCloudDS(new pcl::PointCloud<PointType>());
-        pcl::PointCloud<PointType>::Ptr globalSurfCloud(new pcl::PointCloud<PointType>());
-        pcl::PointCloud<PointType>::Ptr globalSurfCloudDS(new pcl::PointCloud<PointType>());
-        pcl::PointCloud<PointType>::Ptr globalMapCloud(new pcl::PointCloud<PointType>());
-        for (int i = 0; i < (int)cloudKeyPoses3D->size(); i++) {
-            *globalCornerCloud += *transformPointCloud(cornerCloudKeyFrames[i],  &cloudKeyPoses6D->points[i]);
-            *globalSurfCloud   += *transformPointCloud(surfCloudKeyFrames[i],    &cloudKeyPoses6D->points[i]);
-            cout << "\r" << std::flush << "Processing feature cloud " << i << " of " << cloudKeyPoses6D->size() << " ...";
-        }
-        downSizeFilterCorner.setInputCloud(globalCornerCloud);
-        downSizeFilterCorner.filter(*globalCornerCloudDS);
-        pcl::io::savePCDFileASCII(savePCDDirectory + "cloudCorner.pcd", *globalCornerCloudDS);
-        downSizeFilterSurf.setInputCloud(globalSurfCloud);
-        downSizeFilterSurf.filter(*globalSurfCloudDS);
-        pcl::io::savePCDFileASCII(savePCDDirectory + "cloudSurf.pcd", *globalSurfCloudDS);
-        *globalMapCloud += *globalCornerCloud;
-        *globalMapCloud += *globalSurfCloud;
-        pcl::io::savePCDFileASCII(savePCDDirectory + "cloudGlobal.pcd", *globalMapCloud);
-        cout << "****************************************************" << endl;
-        cout << "Saving map to pcd files completed" << endl;
-    }
+    // void visualizeGlobalMapThread()
+    // {
+    //     rclcpp::Rate rate(0.2);
+    //     while (rclcpp::ok()){
+    //         rate.sleep();
+    //         publishGlobalMap();
+    //     }
+    //     if (savePCD == false)
+    //         return;
+    //     cout << "****************************************************" << endl;
+    //     cout << "Saving map to pcd files ..." << endl;
+    //     savePCDDirectory = std::getenv("HOME") + savePCDDirectory;
+    //     int unused = system((std::string("exec rm -r ") + savePCDDirectory).c_str());
+    //     unused = system((std::string("mkdir ") + savePCDDirectory).c_str());
+    //     pcl::io::savePCDFileASCII(savePCDDirectory + "trajectory.pcd", *cloudKeyPoses3D);
+    //     pcl::io::savePCDFileASCII(savePCDDirectory + "transformations.pcd", *cloudKeyPoses6D);
+    //     pcl::PointCloud<PointType>::Ptr globalCornerCloud(new pcl::PointCloud<PointType>());
+    //     pcl::PointCloud<PointType>::Ptr globalCornerCloudDS(new pcl::PointCloud<PointType>());
+    //     pcl::PointCloud<PointType>::Ptr globalSurfCloud(new pcl::PointCloud<PointType>());
+    //     pcl::PointCloud<PointType>::Ptr globalSurfCloudDS(new pcl::PointCloud<PointType>());
+    //     pcl::PointCloud<PointType>::Ptr globalMapCloud(new pcl::PointCloud<PointType>());
+    //     for (int i = 0; i < (int)cloudKeyPoses3D->size(); i++) {
+    //         *globalCornerCloud += *transformPointCloud(cornerCloudKeyFrames[i],  &cloudKeyPoses6D->points[i]);
+    //         *globalSurfCloud   += *transformPointCloud(surfCloudKeyFrames[i],    &cloudKeyPoses6D->points[i]);
+    //         cout << "\r" << std::flush << "Processing feature cloud " << i << " of " << cloudKeyPoses6D->size() << " ...";
+    //     }
+    //     downSizeFilterCorner.setInputCloud(globalCornerCloud);
+    //     downSizeFilterCorner.filter(*globalCornerCloudDS);
+    //     pcl::io::savePCDFileASCII(savePCDDirectory + "cloudCorner.pcd", *globalCornerCloudDS);
+    //     downSizeFilterSurf.setInputCloud(globalSurfCloud);
+    //     downSizeFilterSurf.filter(*globalSurfCloudDS);
+    //     pcl::io::savePCDFileASCII(savePCDDirectory + "cloudSurf.pcd", *globalSurfCloudDS);
+    //     *globalMapCloud += *globalCornerCloud;
+    //     *globalMapCloud += *globalSurfCloud;
+    //     pcl::io::savePCDFileASCII(savePCDDirectory + "cloudGlobal.pcd", *globalMapCloud);
+    //     cout << "****************************************************" << endl;
+    //     cout << "Saving map to pcd files completed" << endl;
+    // }
 
-    void publishGlobalMap()
+    void publishGlobalMap(fins::time_stamp ts)
     {
-        if (pubLaserCloudSurround->get_subscription_count() == 0)
-            return;
-
         if (cloudKeyPoses3D->points.empty() == true)
             return;
 
@@ -487,41 +464,37 @@ public:
         downSizeFilterGlobalMapKeyFrames.setLeafSize(globalMapVisualizationLeafSize, globalMapVisualizationLeafSize, globalMapVisualizationLeafSize); // for global map visualization
         downSizeFilterGlobalMapKeyFrames.setInputCloud(globalMapKeyFrames);
         downSizeFilterGlobalMapKeyFrames.filter(*globalMapKeyFramesDS);
-        publishCloud(pubLaserCloudSurround, globalMapKeyFramesDS, timeLaserInfoStamp, odometryFrame);
+        
+        sensor_msgs::msg::PointCloud2 rosGlobalMap;
+        pcl::toROSMsg(*globalMapKeyFramesDS, rosGlobalMap);
+        rosGlobalMap.header.stamp = timeLaserInfoStamp;
+        rosGlobalMap.header.frame_id = odometryFrame;
+        send<7>(rosGlobalMap, ts);
     }
-
-
-
-
-
-
-
-
-
-
-
 
     void loopClosureThread()
     {
         if (loopClosureEnableFlag == false)
             return;
 
-        rclcpp::Rate rate(loopClosureFrequency);
-        while (rclcpp::ok())
+        while (!stopThread)
         {
-            rate.sleep();
-            performLoopClosure();
-            visualizeLoopClosure();
+            if (isLoopRunning) {
+                performLoopClosure();
+                visualizeLoopClosure();
+            }
+
+            std::this_thread::sleep_for(std::chrono::seconds(1));
         }
     }
 
-    void loopInfoHandler(const std_msgs::msg::Float64MultiArray::SharedPtr loopMsg)
+    void loopInfoHandler(const fins::Msg<std_msgs::msg::Float64MultiArray> &loopMsg)
     {
         std::lock_guard<std::mutex> lock(mtxLoopInfo);
-        if (loopMsg->data.size() != 2)
+        if (loopMsg.data->data.size() != 2)
             return;
 
-        loopInfoVec.push_back(*loopMsg);
+        loopInfoVec.push_back(*loopMsg.data);
 
         while (loopInfoVec.size() > 5)
             loopInfoVec.pop_front();
@@ -552,8 +525,6 @@ public:
             loopFindNearKeyframes(prevKeyframeCloud, loopKeyPre, historyKeyframeSearchNum);
             if (cureKeyframeCloud->size() < 300 || prevKeyframeCloud->size() < 1000)
                 return;
-            if (pubHistoryKeyFrames->get_subscription_count() != 0)
-                publishCloud(pubHistoryKeyFrames, prevKeyframeCloud, timeLaserInfoStamp, odometryFrame);
         }
 
         // ICP Settings
@@ -573,22 +544,13 @@ public:
         if (icp.hasConverged() == false || icp.getFitnessScore() > historyKeyframeFitnessScore)
             return;
 
-        // publish corrected cloud
-        if (pubIcpKeyFrames->get_subscription_count() != 0)
-        {
-            pcl::PointCloud<PointType>::Ptr closed_cloud(new pcl::PointCloud<PointType>());
-            pcl::transformPointCloud(*cureKeyframeCloud, *closed_cloud, icp.getFinalTransformation());
-            publishCloud(pubIcpKeyFrames, closed_cloud, timeLaserInfoStamp, odometryFrame);
-        }
-
         // Get pose transformation
         float x, y, z, roll, pitch, yaw;
         Eigen::Affine3f correctionLidarFrame;
         correctionLidarFrame = icp.getFinalTransformation();
         // transform from world origin to wrong pose
         Eigen::Affine3f tWrong = pclPointToAffine3f(copy_cloudKeyPoses6D->points[loopKeyCur]);
-        // transform from world origin to corrected pose
-        Eigen::Affine3f tCorrect = correctionLidarFrame * tWrong;// pre-multiplying -> successive rotation about a fixed frame
+        Eigen::Affine3f tCorrect = correctionLidarFrame * tWrong;
         pcl::getTranslationAndEulerAngles (tCorrect, x, y, z, roll, pitch, yaw);
         gtsam::Pose3 poseFrom = Pose3(Rot3::RzRyRx(roll, pitch, yaw), Point3(x, y, z));
         gtsam::Pose3 poseTo = pclPointTogtsamPose3(copy_cloudKeyPoses6D->points[loopKeyPre]);
@@ -771,18 +733,8 @@ public:
 
         markerArray.markers.push_back(markerNode);
         markerArray.markers.push_back(markerEdge);
-        pubLoopConstraintEdge->publish(markerArray);
+        send<5>(markerArray, fins::now());
     }
-
-
-
-
-
-
-
-    
-
-
 
     void updateInitialGuess()
     {
@@ -844,21 +796,6 @@ public:
             lastImuTransformation = pcl::getTransformation(0, 0, 0, cloudInfo.imu_roll_init, cloudInfo.imu_pitch_init, cloudInfo.imu_yaw_init); // save imu before return;
             return;
         }
-    }
-
-    void extractForLoopClosure()
-    {
-        pcl::PointCloud<PointType>::Ptr cloudToExtract(new pcl::PointCloud<PointType>());
-        int numPoses = cloudKeyPoses3D->size();
-        for (int i = numPoses-1; i >= 0; --i)
-        {
-            if ((int)cloudToExtract->size() <= surroundingKeyframeSize)
-                cloudToExtract->push_back(cloudKeyPoses3D->points[i]);
-            else
-                break;
-        }
-
-        extractCloud(cloudToExtract);
     }
 
     void extractNearby()
@@ -1187,7 +1124,7 @@ public:
         cv::Mat matB(laserCloudSelNum, 1, CV_32F, cv::Scalar::all(0));
         cv::Mat matAtB(6, 1, CV_32F, cv::Scalar::all(0));
         cv::Mat matX(6, 1, CV_32F, cv::Scalar::all(0));
-        cv::Mat matP(6, 6, CV_32F, cv::Scalar::all(0));
+        cv::Mat matP_cv(6, 6, CV_32F, cv::Scalar::all(0));
 
         PointType pointOri, coeff;
 
@@ -1250,14 +1187,19 @@ public:
                     break;
                 }
             }
-            matP = matV.inv() * matV2;
+            // matP 是 Eigen 类型，这里用中间变量进行转换
+            cv::Mat cvMatP = matV.inv() * matV2;
+            for(int r=0; r<6; r++)
+                for(int c=0; c<6; c++)
+                    matP(r,c) = cvMatP.at<float>(r,c);
         }
 
         if (isDegenerate)
         {
-            cv::Mat matX2(6, 1, CV_32F, cv::Scalar::all(0));
-            matX.copyTo(matX2);
-            matX = matP * matX2;
+            Eigen::Matrix<float, 6, 1> matX_eigen;
+            for(int i=0; i<6; i++) matX_eigen(i,0) = matX.at<float>(i,0);
+            matX_eigen = matP * matX_eigen;
+            for(int i=0; i<6; i++) matX.at<float>(i,0) = matX_eigen(i,0);
         }
 
         transformTobeMapped[0] += matX.at<float>(0, 0);
@@ -1308,7 +1250,7 @@ public:
 
             transformUpdate();
         } else {
-            RCLCPP_WARN(get_logger(), "Not enough features! Only %d edge and %d planar features available.", laserCloudCornerLastDSNum, laserCloudSurfLastDSNum);
+            logger->warn("Not enough features! Only %d edge and %d planar features available.", laserCloudCornerLastDSNum, laserCloudSurfLastDSNum);
         }
     }
 
@@ -1633,7 +1575,7 @@ public:
         globalPath.poses.push_back(pose_stamped);
     }
 
-    void publishOdometry()
+    void publishOdometry(fins::time_stamp ts)
     {
         // Publish odometry for ROS (global)
         nav_msgs::msg::Odometry laserOdometryROS;
@@ -1648,17 +1590,15 @@ public:
         geometry_msgs::msg::Quaternion quat_msg;
         tf2::convert(quat_tf, quat_msg);
         laserOdometryROS.pose.pose.orientation = quat_msg;
-        pubLaserOdometryGlobal->publish(laserOdometryROS);
+        send<0>(laserOdometryROS, ts);
 
-        // Publish TF
-        quat_tf.setRPY(transformTobeMapped[0], transformTobeMapped[1], transformTobeMapped[2]);
         tf2::Transform t_odom_to_lidar = tf2::Transform(quat_tf, tf2::Vector3(transformTobeMapped[3], transformTobeMapped[4], transformTobeMapped[5]));
         tf2::TimePoint time_point = tf2_ros::fromRclcpp(timeLaserInfoStamp);
         tf2::Stamped<tf2::Transform> temp_odom_to_lidar(t_odom_to_lidar, time_point, odometryFrame);
         geometry_msgs::msg::TransformStamped trans_odom_to_lidar;
         tf2::convert(temp_odom_to_lidar, trans_odom_to_lidar);
         trans_odom_to_lidar.child_frame_id = "lidar_link";
-        br->sendTransform(trans_odom_to_lidar);
+        send<8>(trans_odom_to_lidar, ts);
 
         // Publish odometry for ROS (incremental)
         static bool lastIncreOdomPubFlag = false;
@@ -1702,78 +1642,43 @@ public:
             laserOdomIncremental.pose.pose.position.x = x;
             laserOdomIncremental.pose.pose.position.y = y;
             laserOdomIncremental.pose.pose.position.z = z;
-            tf2::Quaternion quat_tf;
-            quat_tf.setRPY(roll, pitch, yaw);
-            geometry_msgs::msg::Quaternion quat_msg;
-            tf2::convert(quat_tf, quat_msg);
-            laserOdomIncremental.pose.pose.orientation = quat_msg;
-            if (isDegenerate)
-                laserOdomIncremental.pose.covariance[0] = 1;
-            else
-                laserOdomIncremental.pose.covariance[0] = 0;
+            tf2::Quaternion quat_tf_inc;
+            quat_tf_inc.setRPY(roll, pitch, yaw);
+            geometry_msgs::msg::Quaternion quat_msg_inc;
+            tf2::convert(quat_tf_inc, quat_msg_inc);
+            laserOdomIncremental.pose.pose.orientation = quat_msg_inc;
+            laserOdomIncremental.pose.covariance[0] = isDegenerate ? 1 : 0;
         }
-        pubLaserOdometryIncremental->publish(laserOdomIncremental);
+        send<1>(laserOdomIncremental, ts);
     }
 
-    void publishFrames()
+    void publishFrames(fins::time_stamp ts)
     {
         if (cloudKeyPoses3D->points.empty())
             return;
-        // publish key poses
-        publishCloud(pubKeyPoses, cloudKeyPoses3D, timeLaserInfoStamp, odometryFrame);
-        // Publish surrounding key frames
-        publishCloud(pubRecentKeyFrames, laserCloudSurfFromMapDS, timeLaserInfoStamp, odometryFrame);
-        // publish registered key frame
-        if (pubRecentKeyFrame->get_subscription_count() != 0)
-        {
-            pcl::PointCloud<PointType>::Ptr cloudOut(new pcl::PointCloud<PointType>());
-            PointTypePose thisPose6D = trans2PointTypePose(transformTobeMapped);
-            *cloudOut += *transformPointCloud(laserCloudCornerLastDS,  &thisPose6D);
-            *cloudOut += *transformPointCloud(laserCloudSurfLastDS,    &thisPose6D);
-            publishCloud(pubRecentKeyFrame, cloudOut, timeLaserInfoStamp, odometryFrame);
-        }
-        // publish registered high-res raw cloud
-        if (pubCloudRegisteredRaw->get_subscription_count() != 0)
-        {
-            pcl::PointCloud<PointType>::Ptr cloudOut(new pcl::PointCloud<PointType>());
-            pcl::fromROSMsg(cloudInfo.cloud_deskewed, *cloudOut);
-            PointTypePose thisPose6D = trans2PointTypePose(transformTobeMapped);
-            *cloudOut = *transformPointCloud(cloudOut,  &thisPose6D);
-            publishCloud(pubCloudRegisteredRaw, cloudOut, timeLaserInfoStamp, odometryFrame);
-        }
-        // publish path
-        if (pubPath->get_subscription_count() != 0)
-        {
-            globalPath.header.stamp = timeLaserInfoStamp;
-            globalPath.header.frame_id = odometryFrame;
-            pubPath->publish(globalPath);
-        }
+        
+        sensor_msgs::msg::PointCloud2 rosCloud;
+        
+        // key poses
+        pcl::toROSMsg(*cloudKeyPoses3D, rosCloud);
+        rosCloud.header.stamp = timeLaserInfoStamp;
+        rosCloud.header.frame_id = odometryFrame;
+        send<2>(rosCloud, ts);
+
+        // Map Local
+        pcl::toROSMsg(*laserCloudSurfFromMapDS, rosCloud);
+        rosCloud.header.stamp = timeLaserInfoStamp;
+        rosCloud.header.frame_id = odometryFrame;
+        send<6>(rosCloud, ts);
+
+        // Path
+        globalPath.header.stamp = timeLaserInfoStamp;
+        globalPath.header.frame_id = odometryFrame;
+        send<3>(globalPath, ts);
+
+        // Global Map (Optional: Can be slow, typically triggered by timer or specific logic)
+        publishGlobalMap(ts);
     }
 };
 
-
-int main(int argc, char** argv)
-{   
-    rclcpp::init(argc, argv);
-
-    rclcpp::NodeOptions options;
-    options.use_intra_process_comms(true);
-    rclcpp::executors::SingleThreadedExecutor exec;
-
-    auto MO = std::make_shared<mapOptimization>(options);
-    exec.add_node(MO);
-
-    RCLCPP_INFO(rclcpp::get_logger("rclcpp"), "\033[1;32m----> Map Optimization Started.\033[0m");
-
-    std::thread loopthread(&mapOptimization::loopClosureThread, MO);
-    std::thread visualizeMapThread(&mapOptimization::visualizeGlobalMapThread, MO);
-
-    exec.spin();
-
-    rclcpp::shutdown();
-
-    loopthread.join();
-    visualizeMapThread.join();
-
-    return 0;
-}
+EXPORT_NODE(mapOptimization)

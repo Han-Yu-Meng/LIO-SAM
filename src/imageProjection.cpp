@@ -1,5 +1,7 @@
+#pragma once
+
 #include "utility.hpp"
-#include "lio_sam/msg/cloud_info.hpp"
+#include "CloudInfo.h"
 
 struct VelodynePointXYZIRT
 {
@@ -37,24 +39,24 @@ const int queueLength = 2000;
 
 class ImageProjection : public ParamServer
 {
+public:
+    void define() override {
+        set_name("ImageProjection");
+        set_description("Project LIDAR point cloud into range image");
+        set_category("SLAM>LIO-SAM");
+
+        register_input<0, sensor_msgs::msg::Imu>("imu", &ImageProjection::imuHandler);
+        register_input<1, nav_msgs::msg::Odometry>("odom", &ImageProjection::odometryHandler);
+        register_input<2, sensor_msgs::msg::PointCloud2>("cloud", &ImageProjection::cloudHandler);
+
+        register_output<0, lio_sam::msg::CloudInfo>("cloud");
+    }
 private:
 
     std::mutex imuLock;
     std::mutex odoLock;
 
-    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr subLaserCloud;
-    rclcpp::CallbackGroup::SharedPtr callbackGroupLidar;
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloud;
-
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubExtractedCloud;
-    rclcpp::Publisher<lio_sam::msg::CloudInfo>::SharedPtr pubLaserCloudInfo;
-
-    rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr subImu;
-    rclcpp::CallbackGroup::SharedPtr callbackGroupImu;
     std::deque<sensor_msgs::msg::Imu> imuQueue;
-
-    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr subOdom;
-    rclcpp::CallbackGroup::SharedPtr callbackGroupOdom;
     std::deque<nav_msgs::msg::Odometry> odomQueue;
 
     std::deque<sensor_msgs::msg::PointCloud2> cloudQueue;
@@ -75,7 +77,7 @@ private:
     pcl::PointCloud<PointType>::Ptr   extractedCloud;
 
     int ringFlag = 0;
-    int deskewFlag;
+    int deskewFlag = 0;
     cv::Mat rangeMat;
 
     bool odomDeskewFlag;
@@ -92,45 +94,27 @@ private:
 
 
 public:
-    ImageProjection(const rclcpp::NodeOptions & options) :
-            ParamServer("lio_sam_imageProjection", options), deskewFlag(0)
-    {
-        callbackGroupLidar = create_callback_group(
-            rclcpp::CallbackGroupType::MutuallyExclusive);
-        callbackGroupImu = create_callback_group(
-            rclcpp::CallbackGroupType::MutuallyExclusive);
-        callbackGroupOdom = create_callback_group(
-            rclcpp::CallbackGroupType::MutuallyExclusive);
-
-        auto lidarOpt = rclcpp::SubscriptionOptions();
-        lidarOpt.callback_group = callbackGroupLidar;
-        auto imuOpt = rclcpp::SubscriptionOptions();
-        imuOpt.callback_group = callbackGroupImu;
-        auto odomOpt = rclcpp::SubscriptionOptions();
-        odomOpt.callback_group = callbackGroupOdom;
-
-        subImu = create_subscription<sensor_msgs::msg::Imu>(
-            imuTopic, qos_imu,
-            std::bind(&ImageProjection::imuHandler, this, std::placeholders::_1),
-            imuOpt);
-        subOdom = create_subscription<nav_msgs::msg::Odometry>(
-            odomTopic + "_incremental", qos_imu,
-            std::bind(&ImageProjection::odometryHandler, this, std::placeholders::_1),
-            odomOpt);
-        subLaserCloud = create_subscription<sensor_msgs::msg::PointCloud2>(
-            pointCloudTopic, qos_lidar,
-            std::bind(&ImageProjection::cloudHandler, this, std::placeholders::_1),
-            lidarOpt);
-
-        pubExtractedCloud = create_publisher<sensor_msgs::msg::PointCloud2>(
-            "lio_sam/deskew/cloud_deskewed", 1);
-        pubLaserCloudInfo = create_publisher<lio_sam::msg::CloudInfo>(
-            "lio_sam/deskew/cloud_info", qos);
-
+    void initialize() override {
+        ParamServer::initialize();
         allocateMemory();
         resetParameters();
 
         pcl::console::setVerbosityLevel(pcl::console::L_ERROR);
+    }
+
+    void run() override {
+
+    }
+
+    void pause() override {
+
+    }
+
+    void reset() override {
+        std::lock_guard<std::mutex> lock1(imuLock);
+        std::lock_guard<std::mutex> lock2(odoLock);
+        imuQueue.clear();
+        odomQueue.clear();
     }
 
     void allocateMemory()
@@ -174,9 +158,10 @@ public:
 
     ~ImageProjection(){}
 
-    void imuHandler(const sensor_msgs::msg::Imu::SharedPtr imuMsg)
+    void imuHandler(const fins::Msg<sensor_msgs::msg::Imu> &msg)
     {
-        sensor_msgs::msg::Imu thisImu = imuConverter(*imuMsg);
+        sensor_msgs::msg::Imu imuMsg = *msg.data;
+        sensor_msgs::msg::Imu thisImu = imuConverter(imuMsg);
 
         std::lock_guard<std::mutex> lock1(imuLock);
         imuQueue.push_back(thisImu);
@@ -199,14 +184,15 @@ public:
         // cout << "roll: " << imuRoll << ", pitch: " << imuPitch << ", yaw: " << imuYaw << endl << endl;
     }
 
-    void odometryHandler(const nav_msgs::msg::Odometry::SharedPtr odometryMsg)
+    void odometryHandler(const fins::Msg<nav_msgs::msg::Odometry> &msg)
     {
         std::lock_guard<std::mutex> lock2(odoLock);
-        odomQueue.push_back(*odometryMsg);
+        odomQueue.push_back(*msg.data);
     }
 
-    void cloudHandler(const sensor_msgs::msg::PointCloud2::SharedPtr laserCloudMsg)
+    void cloudHandler(const fins::Msg<sensor_msgs::msg::PointCloud2> &msg)
     {
+        sensor_msgs::msg::PointCloud2 laserCloudMsg = *msg.data;
         if (!cachePointCloud(laserCloudMsg))
             return;
 
@@ -222,10 +208,10 @@ public:
         resetParameters();
     }
 
-    bool cachePointCloud(const sensor_msgs::msg::PointCloud2::SharedPtr& laserCloudMsg)
+    bool cachePointCloud(const sensor_msgs::msg::PointCloud2& laserCloudMsg)
     {
         // cache point cloud
-        cloudQueue.push_back(*laserCloudMsg);
+        cloudQueue.push_back(laserCloudMsg);
         if (cloudQueue.size() <= 2)
             return false;
 
@@ -256,8 +242,7 @@ public:
         }
         else
         {
-            RCLCPP_ERROR_STREAM(get_logger(), "Unknown sensor type: " << int(sensor));
-            rclcpp::shutdown();
+            logger->error("Unknown sensor type: %d", int(sensor));
         }
 
         // get timestamp
@@ -272,8 +257,7 @@ public:
         // check dense flag
         if (laserCloudIn->is_dense == false)
         {
-            RCLCPP_ERROR(get_logger(), "Point cloud is not in dense format, please remove NaN points first!");
-            rclcpp::shutdown();
+            logger->error("Point cloud is not in dense format, please remove NaN points first!");
         }
 
         // check ring channel
@@ -294,8 +278,7 @@ public:
                 if (sensor == SensorType::VELODYNE) {
                     ringFlag = 2;
                 } else {
-                    RCLCPP_ERROR(get_logger(), "Point cloud ring channel not available, please configure your point cloud data!");
-                    rclcpp::shutdown();
+                    logger->error("Point cloud ring channel not available, please configure your point cloud data!");
                 }
             }
         }
@@ -313,7 +296,8 @@ public:
                 }
             }
             if (deskewFlag == -1)
-                RCLCPP_WARN(get_logger(), "Point cloud timestamp not available, deskew function disabled, system will drift significantly!");
+                logger->error("Point cloud timestamp not available, deskew function disabled, system will drift significantly!");
+
         }
 
         return true;
@@ -329,7 +313,7 @@ public:
             stamp2Sec(imuQueue.front().header.stamp) > timeScanCur ||
             stamp2Sec(imuQueue.back().header.stamp) < timeScanEnd)
         {
-            RCLCPP_INFO(get_logger(), "Waiting for IMU data ...");
+            logger->info("Waiting for IMU data ...");
             return false;
         }
 
@@ -646,26 +630,9 @@ public:
     void publishClouds()
     {
         cloudInfo.header = cloudHeader;
-        cloudInfo.cloud_deskewed  = publishCloud(pubExtractedCloud, extractedCloud, cloudHeader.stamp, lidarFrame);
-        pubLaserCloudInfo->publish(cloudInfo);
+        cloudInfo.cloud_deskewed  = pcl_to_ros(extractedCloud, cloudHeader.stamp, lidarFrame);
+        send<0>(cloudInfo, fins::now());
     }
 };
 
-int main(int argc, char** argv)
-{
-    rclcpp::init(argc, argv);
-
-    rclcpp::NodeOptions options;
-    options.use_intra_process_comms(true);
-    rclcpp::executors::MultiThreadedExecutor exec;
-
-    auto IP = std::make_shared<ImageProjection>(options);
-    exec.add_node(IP);
-
-    RCLCPP_INFO(rclcpp::get_logger("rclcpp"), "\033[1;32m----> Image Projection Started.\033[0m");
-
-    exec.spin();
-
-    rclcpp::shutdown();
-    return 0;
-}
+EXPORT_NODE(ImageProjection)

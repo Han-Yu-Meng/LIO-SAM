@@ -3,7 +3,6 @@
 #define _UTILITY_LIDAR_ODOMETRY_H_
 
 #include <iostream>
-#include <rclcpp/rclcpp.hpp>
 
 #include <std_msgs/msg/header.hpp>
 #include <std_msgs/msg/string.hpp>
@@ -15,6 +14,7 @@
 #include <nav_msgs/msg/path.hpp>
 #include <visualization_msgs/msg/marker.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
+#include <CloudInfo.h>
 
 #include <opencv2/opencv.hpp>
 
@@ -35,8 +35,6 @@
 #include <pcl_conversions/pcl_conversions.h>
 
 #include <tf2/LinearMath/Quaternion.h>
-#include <tf2_ros/transform_listener.h>
-#include <tf2_ros/transform_broadcaster.h>
 #include <tf2_eigen/tf2_eigen.hpp>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
@@ -58,22 +56,19 @@
 #include <thread>
 #include <mutex>
 
+#include <fins/node.hpp>
+#include <fins/agent/parameter_server.hpp>
+
 using namespace std;
 
 typedef pcl::PointXYZI PointType;
 
 enum class SensorType { VELODYNE, OUSTER, LIVOX };
 
-class ParamServer : public rclcpp::Node
+class ParamServer : public fins::Node
 {
 public:
     std::string robot_id;
-
-    //Topics
-    string pointCloudTopic;
-    string imuTopic;
-    string odomTopic;
-    string gpsTopic;
 
     //Frames
     string lidarFrame;
@@ -152,163 +147,99 @@ public:
     float globalMapVisualizationPoseDensity;
     float globalMapVisualizationLeafSize;
 
-    ParamServer(std::string node_name, const rclcpp::NodeOptions & options) : Node(node_name, options)
+
+    virtual void initialize() override
     {
-        declare_parameter("pointCloudTopic", "points");
-        get_parameter("pointCloudTopic", pointCloudTopic);
-        declare_parameter("imuTopic", "imu/data");
-        get_parameter("imuTopic", imuTopic);
-        declare_parameter("odomTopic", "lio_sam/odometry/imu");
-        get_parameter("odomTopic", odomTopic);
-        declare_parameter("gpsTopic", "lio_sam/odometry/gps");
-        get_parameter("gpsTopic", gpsTopic);
+        fins::ParamLoader param("LIO_SAM");
 
-        declare_parameter("lidarFrame", "laser_data_frame");
-        get_parameter("lidarFrame", lidarFrame);
-        declare_parameter("baselinkFrame", "base_link");
-        get_parameter("baselinkFrame", baselinkFrame);
-        declare_parameter("odometryFrame", "odom");
-        get_parameter("odometryFrame", odometryFrame);
-        declare_parameter("mapFrame", "map");
-        get_parameter("mapFrame", mapFrame);
+        lidarFrame = param.get("lidarFrame", "laser_data_frame");
+        baselinkFrame = param.get("baselinkFrame", "base_link");
+        odometryFrame = param.get("odometryFrame", "odom");
+        mapFrame = param.get("mapFrame", "map");
 
-        declare_parameter("useImuHeadingInitialization", false);
-        get_parameter("useImuHeadingInitialization", useImuHeadingInitialization);
-        declare_parameter("useGpsElevation", false);
-        get_parameter("useGpsElevation", useGpsElevation);
-        declare_parameter("gpsCovThreshold", 2.0);
-        get_parameter("gpsCovThreshold", gpsCovThreshold);
-        declare_parameter("poseCovThreshold", 25.0);
-        get_parameter("poseCovThreshold", poseCovThreshold);
+        useImuHeadingInitialization = param.get("useImuHeadingInitialization", false);
+        useGpsElevation = param.get("useGpsElevation", false);
+        gpsCovThreshold = param.get("gpsCovThreshold", 2.0);
+        poseCovThreshold = param.get("poseCovThreshold", 25.0);
 
-        declare_parameter("savePCD", false);
-        get_parameter("savePCD", savePCD);
-        declare_parameter("savePCDDirectory", "/Downloads/LOAM/");
-        get_parameter("savePCDDirectory", savePCDDirectory);
+        std::string sensorStr = param.get("sensor", "ouster");
 
-        std::string sensorStr;
-        declare_parameter("sensor", "ouster");
-        get_parameter("sensor", sensorStr);
-        if (sensorStr == "velodyne")
-        {
+        if (sensorStr == "velodyne") {
             sensor = SensorType::VELODYNE;
         }
-        else if (sensorStr == "ouster")
-        {
+        else if (sensorStr == "ouster") {
             sensor = SensorType::OUSTER;
         }
-        else if (sensorStr == "livox")
-        {
+        else if (sensorStr == "livox") {
             sensor = SensorType::LIVOX;
         }
-        else
-        {
-            RCLCPP_ERROR_STREAM(
-                get_logger(),
-                "Invalid sensor type (must be either 'velodyne' or 'ouster' or 'livox'): " << sensorStr);
-            rclcpp::shutdown();
+        else {
+            logger->error("Unknown sensor type: {}", sensorStr);
         }
 
-        declare_parameter("N_SCAN", 64);
-        get_parameter("N_SCAN", N_SCAN);
-        declare_parameter("Horizon_SCAN", 512);
-        get_parameter("Horizon_SCAN", Horizon_SCAN);
-        declare_parameter("downsampleRate", 1);
-        get_parameter("downsampleRate", downsampleRate);
-        declare_parameter("lidarMinRange", 5.5);
-        get_parameter("lidarMinRange", lidarMinRange);
-        declare_parameter("lidarMaxRange", 1000.0);
-        get_parameter("lidarMaxRange", lidarMaxRange);
+        N_SCAN = param.get("N_SCAN", 64);
+        Horizon_SCAN = param.get("Horizon_SCAN", 512);
+        downsampleRate = param.get("downsampleRate", 1);
+        lidarMinRange = param.get("lidarMinRange", 5.5);
+        lidarMaxRange = param.get("lidarMaxRange", 1000.0);
 
-        declare_parameter("imuAccNoise", 9e-4);
-        get_parameter("imuAccNoise", imuAccNoise);
-        declare_parameter("imuGyrNoise", 1.6e-4);
-        get_parameter("imuGyrNoise", imuGyrNoise);
-        declare_parameter("imuAccBiasN", 5e-4);
-        get_parameter("imuAccBiasN", imuAccBiasN);
-        declare_parameter("imuGyrBiasN", 7e-5);
-        get_parameter("imuGyrBiasN", imuGyrBiasN);
-        declare_parameter("imuGravity", 9.80511);
-        get_parameter("imuGravity", imuGravity);
-        declare_parameter("imuRPYWeight", 0.01);
-        get_parameter("imuRPYWeight", imuRPYWeight);
+        imuAccNoise = param.get("imuAccNoise", 9e-4);
+        imuGyrNoise = param.get("imuGyrNoise", 1.6e-4);
+        imuAccBiasN = param.get("imuAccBiasN", 5e-4);
+        imuGyrBiasN = param.get("imuGyrBiasN", 7e-5);
+        imuGravity = param.get("imuGravity", 9.80511);
+        imuRPYWeight = param.get("imuRPYWeight", 0.01);
 
-        double ida[] = { 1.0,  0.0,  0.0,
-                         0.0,  1.0,  0.0,
-                         0.0,  0.0,  1.0};
-        std::vector < double > id(ida, std::end(ida));
-        declare_parameter("extrinsicRot", id);
-        get_parameter("extrinsicRot", extRotV);
-        declare_parameter("extrinsicRPY", id);
-        get_parameter("extrinsicRPY", extRPYV);
-        double zea[] = {0.0, 0.0, 0.0};
-        std::vector < double > ze(zea, std::end(zea));
-        declare_parameter("extrinsicTrans", ze);
-        get_parameter("extrinsicTrans", extTransV);
+        extRotV = param.get("extrinsicRot", std::vector<double>{1.0, 0.0, 0.0,
+                                                            0.0, 1.0, 0.0,
+                                                            0.0, 0.0, 1.0});
+
+        extRPYV = param.get("extrinsicRPY", std::vector<double>{1.0, 0.0, 0.0,
+                                                            0.0, 1.0, 0.0,
+                                                            0.0, 0.0, 1.0});
+
+        extTransV = param.get("extrinsicTrans", std::vector<double>{0.0, 0.0, 0.0});
 
         extRot = Eigen::Map<const Eigen::Matrix<double, -1, -1, Eigen::RowMajor>>(extRotV.data(), 3, 3);
         extRPY = Eigen::Map<const Eigen::Matrix<double, -1, -1, Eigen::RowMajor>>(extRPYV.data(), 3, 3);
         extTrans = Eigen::Map<const Eigen::Matrix<double, -1, -1, Eigen::RowMajor>>(extTransV.data(), 3, 1);
         extQRPY = Eigen::Quaterniond(extRPY);
 
-        declare_parameter("edgeThreshold", 1.0);
-        get_parameter("edgeThreshold", edgeThreshold);
-        declare_parameter("surfThreshold", 0.1);
-        get_parameter("surfThreshold", surfThreshold);
-        declare_parameter("edgeFeatureMinValidNum", 10);
-        get_parameter("edgeFeatureMinValidNum", edgeFeatureMinValidNum);
-        declare_parameter("surfFeatureMinValidNum", 100);
-        get_parameter("surfFeatureMinValidNum", surfFeatureMinValidNum);
+        edgeThreshold = param.get("edgeThreshold", 1.0);
+        surfThreshold = param.get("surfThreshold", 0.1);
+        edgeFeatureMinValidNum = param.get("edgeFeatureMinValidNum", 10);
+        surfFeatureMinValidNum = param.get("surfFeatureMinValidNum", 100);
 
-        declare_parameter("odometrySurfLeafSize", 0.4);
-        get_parameter("odometrySurfLeafSize", odometrySurfLeafSize);
-        declare_parameter("mappingCornerLeafSize", 0.2);
-        get_parameter("mappingCornerLeafSize", mappingCornerLeafSize);
-        declare_parameter("mappingSurfLeafSize", 0.4);
-        get_parameter("mappingSurfLeafSize", mappingSurfLeafSize);
+        odometrySurfLeafSize = param.get("odometrySurfLeafSize", 0.4);
+        mappingCornerLeafSize = param.get("mappingCornerLeafSize", 0.2);
+        mappingSurfLeafSize = param.get("mappingSurfLeafSize", 0.4);
 
-        declare_parameter("z_tollerance", 1000.0);
-        get_parameter("z_tollerance", z_tollerance);
-        declare_parameter("rotation_tollerance", 1000.0);
-        get_parameter("rotation_tollerance", rotation_tollerance);
+        z_tollerance = param.get("z_tollerance", 1000.0);
+        rotation_tollerance = param.get("rotation_tollerance", 1000.0);
 
-        declare_parameter("numberOfCores", 4);
-        get_parameter("numberOfCores", numberOfCores);
-        declare_parameter("mappingProcessInterval", 0.15);
-        get_parameter("mappingProcessInterval", mappingProcessInterval);
+        numberOfCores = param.get("numberOfCores", 4);
+        mappingProcessInterval = param.get("mappingProcessInterval", 0.15);
 
-        declare_parameter("surroundingkeyframeAddingDistThreshold", 1.0);
-        get_parameter("surroundingkeyframeAddingDistThreshold", surroundingkeyframeAddingDistThreshold);
-        declare_parameter("surroundingkeyframeAddingAngleThreshold", 0.2);
-        get_parameter("surroundingkeyframeAddingAngleThreshold", surroundingkeyframeAddingAngleThreshold);
-        declare_parameter("surroundingKeyframeDensity", 2.0);
-        get_parameter("surroundingKeyframeDensity", surroundingKeyframeDensity);
-        declare_parameter("surroundingKeyframeSearchRadius", 50.0);
-        get_parameter("surroundingKeyframeSearchRadius", surroundingKeyframeSearchRadius);
+        surroundingkeyframeAddingDistThreshold = param.get("surroundingkeyframeAddingDistThreshold", 1.0);
+        surroundingkeyframeAddingAngleThreshold = param.get("surroundingkeyframeAddingAngleThreshold", 0.2);
+        surroundingKeyframeDensity = param.get("surroundingKeyframeDensity", 2.0);
+        surroundingKeyframeSearchRadius = param.get("surroundingKeyframeSearchRadius", 50.0);
 
-        declare_parameter("loopClosureEnableFlag", true);
-        get_parameter("loopClosureEnableFlag", loopClosureEnableFlag);
-        declare_parameter("loopClosureFrequency", 1.0);
-        get_parameter("loopClosureFrequency", loopClosureFrequency);
-        declare_parameter("surroundingKeyframeSize", 50);
-        get_parameter("surroundingKeyframeSize", surroundingKeyframeSize);
-        declare_parameter("historyKeyframeSearchRadius", 15.0);
-        get_parameter("historyKeyframeSearchRadius", historyKeyframeSearchRadius);
-        declare_parameter("historyKeyframeSearchTimeDiff", 30.0);
-        get_parameter("historyKeyframeSearchTimeDiff", historyKeyframeSearchTimeDiff);
-        declare_parameter("historyKeyframeSearchNum", 25);
-        get_parameter("historyKeyframeSearchNum", historyKeyframeSearchNum);
-        declare_parameter("historyKeyframeFitnessScore", 0.3);
-        get_parameter("historyKeyframeFitnessScore", historyKeyframeFitnessScore);
+        loopClosureEnableFlag = param.get("loopClosureEnableFlag", true);
+        loopClosureFrequency = param.get("loopClosureFrequency", 1.0);
+        surroundingKeyframeSize = param.get("surroundingKeyframeSize", 50);
+        historyKeyframeSearchRadius = param.get("historyKeyframeSearchRadius", 15.0);
+        historyKeyframeSearchTimeDiff = param.get("historyKeyframeSearchTimeDiff", 30.0);
+        historyKeyframeSearchNum = param.get("historyKeyframeSearchNum", 25);
+        historyKeyframeFitnessScore = param.get("historyKeyframeFitnessScore", 0.3);
 
-        declare_parameter("globalMapVisualizationSearchRadius", 1000.0);
-        get_parameter("globalMapVisualizationSearchRadius", globalMapVisualizationSearchRadius);
-        declare_parameter("globalMapVisualizationPoseDensity", 10.0);
-        get_parameter("globalMapVisualizationPoseDensity", globalMapVisualizationPoseDensity);
-        declare_parameter("globalMapVisualizationLeafSize", 1.0);
-        get_parameter("globalMapVisualizationLeafSize", globalMapVisualizationLeafSize);
+        globalMapVisualizationSearchRadius = param.get("globalMapVisualizationSearchRadius", 1000.0);
+        globalMapVisualizationPoseDensity = param.get("globalMapVisualizationPoseDensity", 10.0);
+        globalMapVisualizationLeafSize = param.get("globalMapVisualizationLeafSize", 1.0);
+    }
 
-        usleep(100);
+    virtual void define() {
+
     }
 
     sensor_msgs::msg::Imu imuConverter(const sensor_msgs::msg::Imu& imu_in)
@@ -336,23 +267,19 @@ public:
 
         if (sqrt(q_final.x()*q_final.x() + q_final.y()*q_final.y() + q_final.z()*q_final.z() + q_final.w()*q_final.w()) < 0.1)
         {
-            RCLCPP_ERROR(get_logger(), "Invalid quaternion, please use a 9-axis IMU!");
-            rclcpp::shutdown();
+            logger->error("Invalid quaternion, please use a 9-axis IMU!");
         }
 
         return imu_out;
     }
 };
 
-
-sensor_msgs::msg::PointCloud2 publishCloud(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr thisPub, pcl::PointCloud<PointType>::Ptr thisCloud, rclcpp::Time thisStamp, std::string thisFrame)
+sensor_msgs::msg::PointCloud2 pcl_to_ros(pcl::PointCloud<PointType>::Ptr thisCloud, rclcpp::Time thisStamp, std::string thisFrame)
 {
     sensor_msgs::msg::PointCloud2 tempCloud;
     pcl::toROSMsg(*thisCloud, tempCloud);
     tempCloud.header.stamp = thisStamp;
     tempCloud.header.frame_id = thisFrame;
-    if (thisPub->get_subscription_count() != 0)
-        thisPub->publish(tempCloud);
     return tempCloud;
 }
 
@@ -405,62 +332,5 @@ float pointDistance(PointType p1, PointType p2)
 {
     return sqrt((p1.x-p2.x)*(p1.x-p2.x) + (p1.y-p2.y)*(p1.y-p2.y) + (p1.z-p2.z)*(p1.z-p2.z));
 }
-
-rmw_qos_profile_t qos_profile{
-    RMW_QOS_POLICY_HISTORY_KEEP_LAST,
-    1,
-    RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT,
-    RMW_QOS_POLICY_DURABILITY_VOLATILE,
-    RMW_QOS_DEADLINE_DEFAULT,
-    RMW_QOS_LIFESPAN_DEFAULT,
-    RMW_QOS_POLICY_LIVELINESS_SYSTEM_DEFAULT,
-    RMW_QOS_LIVELINESS_LEASE_DURATION_DEFAULT,
-    false
-};
-
-auto qos = rclcpp::QoS(
-    rclcpp::QoSInitialization(
-        qos_profile.history,
-        qos_profile.depth
-    ),
-    qos_profile);
-
-rmw_qos_profile_t qos_profile_imu{
-    RMW_QOS_POLICY_HISTORY_KEEP_LAST,
-    2000,
-    RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT,
-    RMW_QOS_POLICY_DURABILITY_VOLATILE,
-    RMW_QOS_DEADLINE_DEFAULT,
-    RMW_QOS_LIFESPAN_DEFAULT,
-    RMW_QOS_POLICY_LIVELINESS_SYSTEM_DEFAULT,
-    RMW_QOS_LIVELINESS_LEASE_DURATION_DEFAULT,
-    false
-};
-
-auto qos_imu = rclcpp::QoS(
-    rclcpp::QoSInitialization(
-        qos_profile_imu.history,
-        qos_profile_imu.depth
-    ),
-    qos_profile_imu);
-
-rmw_qos_profile_t qos_profile_lidar{
-    RMW_QOS_POLICY_HISTORY_KEEP_LAST,
-    5,
-    RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT,
-    RMW_QOS_POLICY_DURABILITY_VOLATILE,
-    RMW_QOS_DEADLINE_DEFAULT,
-    RMW_QOS_LIFESPAN_DEFAULT,
-    RMW_QOS_POLICY_LIVELINESS_SYSTEM_DEFAULT,
-    RMW_QOS_LIVELINESS_LEASE_DURATION_DEFAULT,
-    false
-};
-
-auto qos_lidar = rclcpp::QoS(
-    rclcpp::QoSInitialization(
-        qos_profile_lidar.history,
-        qos_profile_lidar.depth
-    ),
-    qos_profile_lidar);
 
 #endif

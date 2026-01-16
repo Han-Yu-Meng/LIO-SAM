@@ -1,0 +1,10 @@
+name: "lio_sam"
+version: "0.1.0"
+description: "A real-time lidar-inertial odometry package."
+maintainers:
+  - name: "Tixiao Shan"
+    email: "shant@mit.edu"
+  - name: "fins"
+    email: "fins@sjtu.edu.cn"
+licenses:
+  - "BSD 3-Clause"
