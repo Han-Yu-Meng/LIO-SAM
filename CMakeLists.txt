@@ -19,6 +19,33 @@ add_compile_options(
     -Wno-maybe-uninitialized 
 )
 
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -g -fno-omit-frame-pointer")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=address -g -fno-omit-frame-pointer")
+set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -fsanitize=address")
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=address")
+
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+set(GTSAM_BUILD_STATIC_LIBRARY ON CACHE BOOL "" FORCE)
+set(GTSAM_BUILD_SHARED_LIBRARY OFF CACHE BOOL "" FORCE)
+
+set(GTSAM_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(GTSAM_BUILD_EXAMPLES_ALWAYS OFF CACHE BOOL "" FORCE)
+set(GTSAM_BUILD_TIMING_ALWAYS OFF CACHE BOOL "" FORCE)
+set(GTSAM_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+set(GTSAM_INSTALL_HEADERS ON CACHE BOOL "" FORCE)
+
+set(GTSAM_USE_SYSTEM_EIGEN ON CACHE BOOL "" FORCE)
+
+set(GTSAM_WITH_TBB ON CACHE BOOL "" FORCE) 
+
+set(GTSAM_BUILD_WITH_MARCH_NATIVE ON CACHE BOOL "" FORCE)
+
+add_subdirectory(external/gtsam)
+
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/external/gtsam/gtsam)
+include_directories(${CMAKE_CURRENT_BINARY_DIR}/external/gtsam)
+
 if(NOT MSVC)
     add_compile_options(-fexceptions -pthread)
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm|aarch64|ARM|AARCH64)")
@@ -68,16 +95,17 @@ target_include_directories(${PROJECT_NAME} PUBLIC
     ${EIGEN3_INCLUDE_DIR}
     ${PCL_INCLUDE_DIRS}
     ${OpenCV_INCLUDE_DIRS}
-    ${GTSAM_INCLUDE_DIR}
 )
 
 target_link_libraries(${PROJECT_NAME} PRIVATE 
     fins_sdk
-    gtsam
+    gtsam 
     OpenMP::OpenMP_CXX
     ${PCL_LIBRARIES}
     ${OpenCV_LIBRARIES}
 )
+
+add_dependencies(${PROJECT_NAME} gtsam)
 
 foreach(pkg ${ROS_MSG_PKGS})
     if(TARGET ${pkg}::${pkg}__rosidl_generator_cpp)

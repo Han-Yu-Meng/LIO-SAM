@@ -40,6 +40,8 @@ const int queueLength = 2000;
 class ImageProjection : public ParamServer
 {
 public:
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    
     void define() override {
         set_name("ImageProjection");
         set_description("Project LIDAR point cloud into range image");

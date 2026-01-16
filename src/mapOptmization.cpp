@@ -49,14 +49,14 @@ typedef PointXYZIRPYT  PointTypePose;
 
 class mapOptimization : public ParamServer
 {
-
 public:
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW 
 
     // gtsam
     NonlinearFactorGraph gtSAMgraph;
     Values initialEstimate;
     Values optimizedEstimate;
-    ISAM2 *isam;
+    ISAM2 *isam = nullptr;
     Values isamCurrentEstimate;
     Eigen::MatrixXd poseCovariance;
 
@@ -162,12 +162,16 @@ private:
 
 public:
     void initialize() override {
+        logger->info("Initializing Map Optimization...");
+
         ParamServer::initialize();
 
         ISAM2Params parameters;
         parameters.relinearizeThreshold = 0.1;
         parameters.relinearizeSkip = 1;
         isam = new ISAM2(parameters);
+        
+        gtSAMgraph.resize(0);
 
         downSizeFilterCorner.setLeafSize(mappingCornerLeafSize, mappingCornerLeafSize, mappingCornerLeafSize);
         downSizeFilterSurf.setLeafSize(mappingSurfLeafSize, mappingSurfLeafSize, mappingSurfLeafSize);
@@ -180,6 +184,8 @@ public:
         if (!loopThread.joinable()) {
             loopThread = std::thread(&mapOptimization::loopClosureThread, this);
         }
+
+        logger->info("Map Optimization Initialized.");
     }
 
     void run() override {
@@ -194,10 +200,23 @@ public:
 
     void reset() override {
         std::lock_guard<std::mutex> lock(mtx);
+        
         gtSAMgraph.resize(0);
         initialEstimate.clear();
         optimizedEstimate.clear();
         isamCurrentEstimate.clear();
+        
+        if (isam != nullptr) {
+            delete isam;
+            isam = nullptr;
+        }
+        ISAM2Params parameters;
+        parameters.relinearizeThreshold = 0.1;
+        parameters.relinearizeSkip = 1;
+        isam = new ISAM2(parameters);
+
+        gpsQueue.clear();
+
         poseCovariance.resize(0,0);
         laserCloudMapContainer.clear();
         cloudKeyPoses3D->clear();
@@ -212,7 +231,7 @@ public:
         laserCloudSurfLastDS->clear();
         laserCloudOri->clear();
         coeffSel->clear();
-        laserCloudMapContainer.clear();
+        
         aLoopIsClosed = false;
         loopIndexContainer.clear();
         loopIndexQueue.clear();
@@ -220,6 +239,7 @@ public:
         loopNoiseQueue.clear();
         loopInfoVec.clear();
         globalPath.poses.clear();
+        
         for (int i = 0; i < 6; ++i){
             transformTobeMapped[i] = 0;
         }

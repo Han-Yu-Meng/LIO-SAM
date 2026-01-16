@@ -68,6 +68,8 @@ enum class SensorType { VELODYNE, OUSTER, LIVOX };
 class ParamServer : public fins::Node
 {
 public:
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    
     std::string robot_id;
 
     //Frames
