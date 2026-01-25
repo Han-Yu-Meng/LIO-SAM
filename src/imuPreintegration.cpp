@@ -44,12 +44,12 @@ public:
         set_description("Fusion of lidar odometry and IMU odometry");
         set_category("SLAM>LIO-SAM");
 
-        register_input<0, nav_msgs::msg::Odometry>("lidar_odom", &TransformFusion::lidarOdometryHandler);
-        register_input<1, nav_msgs::msg::Odometry>("imu_odom", &TransformFusion::imuOdometryHandler);
+        register_input<nav_msgs::msg::Odometry>("lidar_odom", &TransformFusion::lidarOdometryHandler);
+        register_input<nav_msgs::msg::Odometry>("imu_odom", &TransformFusion::imuOdometryHandler);
 
-        register_output<0, nav_msgs::msg::Odometry>("odom");
-        register_output<1, nav_msgs::msg::Path>("path");
-        register_output<2, geometry_msgs::msg::TransformStamped>("tf");
+        register_output<nav_msgs::msg::Odometry>("odom");
+        register_output<nav_msgs::msg::Path>("path");
+        register_output<geometry_msgs::msg::TransformStamped>("tf_odom_base");
     }
 
     void initialize() override {
@@ -87,15 +87,15 @@ public:
     void lidarOdometryHandler(const fins::Msg<nav_msgs::msg::Odometry> &msg)
     {
         std::lock_guard<std::mutex> lock(mtx);
-        lidarOdomAffine = odom2affine(*msg.data);
-        lidarOdomTime = stamp2Sec(msg.data->header.stamp);
+        lidarOdomAffine = odom2affine(*msg);
+        lidarOdomTime = stamp2Sec(msg->header.stamp);
     }
 
     void imuOdometryHandler(const fins::Msg<nav_msgs::msg::Odometry> &msg)
     {
         std::lock_guard<std::mutex> lock(mtx);
 
-        imuOdomQueue.push_back(*msg.data);
+        imuOdomQueue.push_back(*msg);
 
         // get latest odometry (at current IMU stamp)
         if (lidarOdomTime == -1)
@@ -125,22 +125,22 @@ public:
         laserOdometry.pose.pose.position.y = t.transform.translation.y;
         laserOdometry.pose.pose.position.z = t.transform.translation.z;
         laserOdometry.pose.pose.orientation = t.transform.rotation;
-        send<0>(laserOdometry, msg.event_time);
+        send("odom", laserOdometry, msg.acq_time);
 
-        // publish tf
+        // Publish TF: odom → base_link
         if(lidarFrame != baselinkFrame)
         {
-            tf2::Transform t_odom_base = tCur * lidar2BaselinkStatic;
+            tf2::Transform t_odom_to_base = tCur * lidar2BaselinkStatic;
             
-            tCur.setData(t_odom_base);
-            tCur.stamp_ = tf2_ros::fromMsg(msg.data->header.stamp);
+            tCur.setData(t_odom_to_base);
+            tCur.stamp_ = tf2_ros::fromMsg(msg->header.stamp);
             tCur.frame_id_ = odometryFrame;
         }
 
         geometry_msgs::msg::TransformStamped ts;
         tf2::convert(tCur, ts);
         ts.child_frame_id = baselinkFrame;
-        send<2>(ts, msg.event_time);
+        send("tf_odom_base", ts, msg.acq_time);  // odom → base_link
 
         // publish IMU path
         static nav_msgs::msg::Path imuPath;
@@ -159,7 +159,7 @@ public:
             
             imuPath.header.stamp = imuOdomQueue.back().header.stamp;
             imuPath.header.frame_id = odometryFrame;
-            send<1>(imuPath, msg.event_time);
+            send("imu_path", imuPath, msg.acq_time);
         }
     }
 };
@@ -278,19 +278,19 @@ public:
     {
         std::lock_guard<std::mutex> lock(mtx);
 
-        double currentCorrectionTime = stamp2Sec(msg.data->header.stamp);
+        double currentCorrectionTime = stamp2Sec(msg->header.stamp);
 
         if (imuQueOpt.empty())
             return;
 
-        float p_x = msg.data->pose.pose.position.x;
-        float p_y = msg.data->pose.pose.position.y;
-        float p_z = msg.data->pose.pose.position.z;
-        float r_x = msg.data->pose.pose.orientation.x;
-        float r_y = msg.data->pose.pose.orientation.y;
-        float r_z = msg.data->pose.pose.orientation.z;
-        float r_w = msg.data->pose.pose.orientation.w;
-        bool degenerate = (int)msg.data->pose.covariance[0] == 1 ? true : false;
+        float p_x = msg->pose.pose.position.x;
+        float p_y = msg->pose.pose.position.y;
+        float p_z = msg->pose.pose.position.z;
+        float r_x = msg->pose.pose.orientation.x;
+        float r_y = msg->pose.pose.orientation.y;
+        float r_z = msg->pose.pose.orientation.z;
+        float r_w = msg->pose.pose.orientation.w;
+        bool degenerate = (int)msg->pose.covariance[0] == 1 ? true : false;
         gtsam::Pose3 lidarPose = gtsam::Pose3(gtsam::Rot3::Quaternion(r_w, r_x, r_y, r_z), gtsam::Point3(p_x, p_y, p_z));
 
 
@@ -483,7 +483,7 @@ public:
     {
         std::lock_guard<std::mutex> lock(mtx);
 
-        sensor_msgs::msg::Imu thisImu = imuConverter(*msg.data);
+        sensor_msgs::msg::Imu thisImu = imuConverter(*msg);
 
         imuQueOpt.push_back(thisImu);
         imuQueImu.push_back(thisImu);
@@ -526,7 +526,7 @@ public:
         odometry.twist.twist.angular.x = thisImu.angular_velocity.x + prevBiasOdom.gyroscope().x();
         odometry.twist.twist.angular.y = thisImu.angular_velocity.y + prevBiasOdom.gyroscope().y();
         odometry.twist.twist.angular.z = thisImu.angular_velocity.z + prevBiasOdom.gyroscope().z();
-        send<0>(odometry, msg.event_time);
+        send("odom", odometry, msg.acq_time);
     }
 };
 

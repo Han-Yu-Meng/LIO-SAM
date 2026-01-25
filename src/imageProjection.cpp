@@ -47,11 +47,11 @@ public:
         set_description("Project LIDAR point cloud into range image");
         set_category("SLAM>LIO-SAM");
 
-        register_input<0, sensor_msgs::msg::Imu>("imu", &ImageProjection::imuHandler);
-        register_input<1, nav_msgs::msg::Odometry>("odom", &ImageProjection::odometryHandler);
-        register_input<2, sensor_msgs::msg::PointCloud2>("cloud", &ImageProjection::cloudHandler);
+        register_input<sensor_msgs::msg::Imu>("imu", &ImageProjection::imuHandler);
+        register_input<nav_msgs::msg::Odometry>("odom", &ImageProjection::odometryHandler);
+        register_input<sensor_msgs::msg::PointCloud2>("cloud", &ImageProjection::cloudHandler);
 
-        register_output<0, lio_sam::msg::CloudInfo>("cloud");
+        register_output<lio_sam::msg::CloudInfo>("cloud");
     }
 private:
 
@@ -162,7 +162,7 @@ public:
 
     void imuHandler(const fins::Msg<sensor_msgs::msg::Imu> &msg)
     {
-        sensor_msgs::msg::Imu imuMsg = *msg.data;
+        sensor_msgs::msg::Imu imuMsg = *msg;
         sensor_msgs::msg::Imu thisImu = imuConverter(imuMsg);
 
         std::lock_guard<std::mutex> lock1(imuLock);
@@ -189,12 +189,12 @@ public:
     void odometryHandler(const fins::Msg<nav_msgs::msg::Odometry> &msg)
     {
         std::lock_guard<std::mutex> lock2(odoLock);
-        odomQueue.push_back(*msg.data);
+        odomQueue.push_back(*msg);
     }
 
 void cloudHandler(const fins::Msg<sensor_msgs::msg::PointCloud2> &msg)
     {
-        sensor_msgs::msg::PointCloud2 laserCloudMsg = *msg.data;
+        sensor_msgs::msg::PointCloud2 laserCloudMsg = *msg;
         
         // DEBUG 1
         logger->infof("Received Cloud: time=%.4f", stamp2Sec(laserCloudMsg.header.stamp));
@@ -653,7 +653,7 @@ bool deskewInfo()
     {
         cloudInfo.header = cloudHeader;
         cloudInfo.cloud_deskewed  = pcl_to_ros(extractedCloud, cloudHeader.stamp, lidarFrame);
-        send<0>(cloudInfo, fins::now());
+        send("cloud", cloudInfo, fins::now());
     }
 };
 

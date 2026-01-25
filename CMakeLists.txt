@@ -63,9 +63,32 @@ find_package(OpenCV REQUIRED)
 find_package(GTSAM REQUIRED)
 find_package(OpenMP REQUIRED)
 
-find_package(rclcpp QUIET)
+include(ProcessorCount)
+ProcessorCount(N)
+if(N GREATER 1)
+  add_definitions(-DMP_EN -DMP_PROC_NUM=${N})
+endif()
 
-set(ROS_MSG_PKGS
+fins_add_node(${PROJECT_NAME} src/nodes.cpp)
+
+target_include_directories(${PROJECT_NAME} PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/lio_sam>
+    ${EIGEN3_INCLUDE_DIR}
+    ${PCL_INCLUDE_DIRS}
+    ${OpenCV_INCLUDE_DIRS}
+)
+
+target_link_libraries(${PROJECT_NAME} PRIVATE 
+    gtsam 
+    OpenMP::OpenMP_CXX
+    ${PCL_LIBRARIES}
+    ${OpenCV_LIBRARIES}
+)
+
+add_dependencies(${PROJECT_NAME} gtsam)
+
+fins_link_ros_dependencies(${PROJECT_NAME}
+    rclcpp 
     std_msgs
     sensor_msgs
     geometry_msgs
@@ -77,46 +100,4 @@ set(ROS_MSG_PKGS
     tf2_geometry_msgs 
     tf2_eigen
 )
-
-foreach(pkg ${ROS_MSG_PKGS})
-    find_package(${pkg} REQUIRED)
-endforeach()
-
-include(ProcessorCount)
-ProcessorCount(N)
-if(N GREATER 1)
-  add_definitions(-DMP_EN -DMP_PROC_NUM=${N})
-endif()
-
-add_library(${PROJECT_NAME} SHARED src/nodes.cpp)
-
-target_include_directories(${PROJECT_NAME} PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/lio_sam>
-    ${EIGEN3_INCLUDE_DIR}
-    ${PCL_INCLUDE_DIRS}
-    ${OpenCV_INCLUDE_DIRS}
-)
-
-target_link_libraries(${PROJECT_NAME} PRIVATE 
-    fins_sdk
-    gtsam 
-    OpenMP::OpenMP_CXX
-    ${PCL_LIBRARIES}
-    ${OpenCV_LIBRARIES}
-)
-
-add_dependencies(${PROJECT_NAME} gtsam)
-
-foreach(pkg ${ROS_MSG_PKGS})
-    if(TARGET ${pkg}::${pkg}__rosidl_generator_cpp)
-        target_link_libraries(${PROJECT_NAME} PRIVATE ${pkg}::${pkg}__rosidl_generator_cpp)
-    
-    elseif(TARGET ${pkg}::${pkg})
-        target_link_libraries(${PROJECT_NAME} PRIVATE ${pkg}::${pkg})
-    
-    else()
-        target_include_directories(${PROJECT_NAME} PRIVATE ${${pkg}_INCLUDE_DIRS})
-        target_link_libraries(${PROJECT_NAME} PRIVATE ${${pkg}_LIBRARIES})
-    endif()
-endforeach()
 

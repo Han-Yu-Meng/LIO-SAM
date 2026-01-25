@@ -56,11 +56,11 @@ public:
         set_description("Extract corner and surface features from deskewed point cloud");
         set_category("SLAM>LIO-SAM");
 
-        register_input<0, lio_sam::msg::CloudInfo>("cloud_info", &FeatureExtraction::laserCloudInfoHandler);
+        register_input<lio_sam::msg::CloudInfo>("cloud_info", &FeatureExtraction::laserCloudInfoHandler);
 
-        register_output<0, lio_sam::msg::CloudInfo>("cloud_info");
-        register_output<1, sensor_msgs::msg::PointCloud2>("corner");
-        register_output<2, sensor_msgs::msg::PointCloud2>("surface");
+        register_output<lio_sam::msg::CloudInfo>("cloud_info");
+        register_output<sensor_msgs::msg::PointCloud2>("corner");
+        register_output<sensor_msgs::msg::PointCloud2>("surface");
     }
 
     void run() override {
@@ -87,7 +87,7 @@ public:
 
         extractFeatures();
 
-        publishFeatureCloud(msgIn.event_time);
+        publishFeatureCloud(msgIn.acq_time);
     }
 
     void calculateSmoothness()
@@ -254,7 +254,7 @@ public:
         cloudInfo.point_range.clear();
     }
 
-    void publishFeatureCloud(fins::time_stamp event_time)
+    void publishFeatureCloud(fins::AcqTime acq_time)
     {
         // free cloud info memory
         freeCloudInfoMemory();
@@ -272,9 +272,9 @@ public:
         cloudInfo.cloud_surface = tempSurfaceCloud;
 
         // publish to mapOptimization
-        send<0>(cloudInfo, event_time);
-        send<1>(tempCornerCloud, event_time);
-        send<2>(tempSurfaceCloud, event_time);
+        send("cloud_info", cloudInfo, acq_time);
+        send("corner", tempCornerCloud, acq_time);
+        send("surface", tempSurfaceCloud, acq_time);
     }
 };
 

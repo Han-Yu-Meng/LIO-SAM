@@ -134,30 +134,39 @@ public:
 
     std::thread loopThread;
 
+    std::thread mapOptThread;
+    std::mutex mtxMapOpt;
+    std::condition_variable cvMapOpt;
+    std::atomic<bool> hasNewTask{false};
+    lio_sam::msg::CloudInfo pendingCloudInfo;
+
+
     void define() override {
         set_name("MapOptimization");
         set_description("LIO-SAM map optimization and factor graph management");
         set_category("SLAM>LIO-SAM");
 
         // Inputs
-        register_input<0, lio_sam::msg::CloudInfo>("cloud_info", &mapOptimization::laserCloudInfoHandler);
-        register_input<1, nav_msgs::msg::Odometry>("gps_odom", &mapOptimization::gpsHandler);
-        register_input<2, std_msgs::msg::Float64MultiArray>("loop_info", &mapOptimization::loopInfoHandler);
+        register_input<lio_sam::msg::CloudInfo>("cloud_info", &mapOptimization::laserCloudInfoHandler);
+        register_input<nav_msgs::msg::Odometry>("gps_odom", &mapOptimization::gpsHandler);
+        register_input<std_msgs::msg::Float64MultiArray>("loop_info", &mapOptimization::loopInfoHandler);
 
         // Outputs
-        register_output<0, nav_msgs::msg::Odometry>("odom_global");
-        register_output<1, nav_msgs::msg::Odometry>("odom_incremental");
-        register_output<2, sensor_msgs::msg::PointCloud2>("key_poses");
-        register_output<3, nav_msgs::msg::Path>("path");
-        register_output<4, sensor_msgs::msg::PointCloud2>("cloud_registered");
-        register_output<5, visualization_msgs::msg::MarkerArray>("loop");
-        register_output<6, sensor_msgs::msg::PointCloud2>("map_local");
-        register_output<7, sensor_msgs::msg::PointCloud2>("map_global");
-        register_output<8, geometry_msgs::msg::TransformStamped>("tf");
+        register_output<nav_msgs::msg::Odometry>("odom_global");
+        register_output<nav_msgs::msg::Odometry>("odom_incremental");
+        register_output<sensor_msgs::msg::PointCloud2>("key_poses");
+        register_output<nav_msgs::msg::Path>("path");
+        register_output<sensor_msgs::msg::PointCloud2>("cloud_registered");
+        register_output<visualization_msgs::msg::MarkerArray>("loop");
+        register_output<sensor_msgs::msg::PointCloud2>("map_local");
+        register_output<sensor_msgs::msg::PointCloud2>("map_global");
+        register_output<geometry_msgs::msg::TransformStamped>("tf_odom_lidar");
     }
 
 private:
     std::atomic<bool> isLoopRunning{false};
+    std::atomic<bool> isMapOptRunning{false};
+    std::atomic<bool> isProcessing{false};
     std::atomic<bool> stopThread{false};
 
 public:
@@ -179,10 +188,20 @@ public:
         downSizeFilterSurroundingKeyPoses.setLeafSize(surroundingKeyframeDensity, surroundingKeyframeDensity, surroundingKeyframeDensity); 
 
         allocateMemory();
+
+        if (loopThread.joinable()) {
+            stopThread = true;
+            loopThread.join();
+        }
+
         stopThread = false;
         isLoopRunning = false;
         if (!loopThread.joinable()) {
             loopThread = std::thread(&mapOptimization::loopClosureThread, this);
+        }
+
+        if (!mapOptThread.joinable()) {
+            mapOptThread = std::thread(&mapOptimization::mapOptimizationThread, this);
         }
 
         logger->info("Map Optimization Initialized.");
@@ -190,11 +209,13 @@ public:
 
     void run() override {
         isLoopRunning = true;
+        isMapOptRunning = true;
         logger->info("Map Optimization Loop Closure Started.");
     }
 
     void pause() override {
         isLoopRunning = false;
+        isMapOptRunning = false;
         logger->info("Map Optimization Loop Closure Paused.");
     }
 
@@ -248,8 +269,12 @@ public:
     }
 
     ~mapOptimization() {
+        stopThread = true;
+        cvMapOpt.notify_all();
         if (loopThread.joinable())
             loopThread.join();
+        if (mapOptThread.joinable())
+            mapOptThread.join();
     }
 
     void allocateMemory()
@@ -295,87 +320,129 @@ public:
         matP.setZero();
     }
 
-    void laserCloudInfoHandler(const fins::Msg<lio_sam::msg::CloudInfo> &msgIn)
+    void mapOptimizationThread()
+    {
+        logger->info("Map Optimization Thread Started");
+        
+        while (!stopThread)
+        {
+            // 等待新任务
+            std::unique_lock<std::mutex> lock(mtxMapOpt);
+            cvMapOpt.wait(lock, [this] { return hasNewTask.load() || stopThread.load(); });
+            
+            if (stopThread)
+                break;
+            
+            if (!hasNewTask || !isMapOptRunning)
+                continue;
+            
+            // 标记开始处理
+            isProcessing = true;
+            hasNewTask = false;
+            
+            // 复制任务数据
+            lio_sam::msg::CloudInfo currentCloudInfo = pendingCloudInfo;
+            lock.unlock();
+            
+            // 执行地图优化（不持有锁）
+            try {
+                processMapOptimization(currentCloudInfo);
+            } catch (const std::exception& e) {
+                logger->error("Map optimization failed: {}", e.what());
+            }
+            
+            // 标记处理完成
+            isProcessing = false;
+        }
+        
+        logger->info("Map Optimization Thread Stopped");
+    }
+    
+    void processMapOptimization(const lio_sam::msg::CloudInfo& msgIn)
     {
         // extract time stamp
-        timeLaserInfoStamp = msgIn.data->header.stamp;
-        timeLaserInfoCur = stamp2Sec(msgIn.data->header.stamp);
+        timeLaserInfoStamp = msgIn.header.stamp;
+        timeLaserInfoCur = stamp2Sec(msgIn.header.stamp);
 
         // extract info and feature cloud
-        cloudInfo = *msgIn.data;
-        pcl::fromROSMsg(msgIn.data->cloud_corner,  *laserCloudCornerLast);
-        pcl::fromROSMsg(msgIn.data->cloud_surface, *laserCloudSurfLast);
+        cloudInfo = msgIn;
+        pcl::fromROSMsg(msgIn.cloud_corner,  *laserCloudCornerLast);
+        pcl::fromROSMsg(msgIn.cloud_surface, *laserCloudSurfLast);
 
         std::lock_guard<std::mutex> lock(mtx);
 
         static double timeLastProcessing = -1;
 
-        logger->infof("Handler: Corner Size %zu, Surf Size %zu", laserCloudCornerLast->size(), laserCloudSurfLast->size());
+        logger->debug("Processing: Corner Size {}, Surf Size {}", 
+                      laserCloudCornerLast->size(), laserCloudSurfLast->size());
 
         if (timeLaserInfoCur - timeLastProcessing >= mappingProcessInterval)
         {
             timeLastProcessing = timeLaserInfoCur;
 
-            logger->infof("--- Start Processing Frame ---");
+            logger->debug("--- Start Processing Frame ---");
 
             {
                 FINS_TIME_BLOCK(logger, "updateInitialGuess");
                 updateInitialGuess();
             }
 
-            logger->infof("1. Initial Guess: [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f]", 
-                          transformTobeMapped[0], transformTobeMapped[1], transformTobeMapped[2],
-                          transformTobeMapped[3], transformTobeMapped[4], transformTobeMapped[5]);
-
             {
                 FINS_TIME_BLOCK(logger, "Extract Surrounding Key Frames");
                 extractSurroundingKeyFrames();
             }
-
-            logger->infof("2. Surrounding Key Frames Extracted");
 
             {
                 FINS_TIME_BLOCK(logger, "downsampleCurrentScan");
                 downsampleCurrentScan();
             }
 
-            logger->infof("3. Current Scan Downsampled: Corner %d, Surf %d", laserCloudCornerLastDSNum, laserCloudSurfLastDSNum);
-
             {
                 FINS_TIME_BLOCK(logger, "scan2MapOptimization");
                 scan2MapOptimization();
             }
-
-            logger->infof("4. Scan-to-Map Optimization Done");
 
             {
                 FINS_TIME_BLOCK(logger, "saveKeyFramesAndFactor");
                 saveKeyFramesAndFactor();
             }
 
-            logger->infof("5. Key Frames and Factors Saved");
-
             {
                 FINS_TIME_BLOCK(logger, "correctPoses");
                 correctPoses();
             }
 
-            logger->infof("6. Poses Corrected");
-
             {
                 FINS_TIME_BLOCK(logger, "publishOdometry");
-                publishOdometry(msgIn.event_time);
+                publishOdometry(fins::now());
             }
-
-            logger->infof("7. Odometry Published");
 
             {
                 FINS_TIME_BLOCK(logger, "publishFrames");
-                publishFrames(msgIn.event_time);
+                publishFrames(fins::now());
             }
 
-            logger->infof("--- Frame Processing Complete ---");
+            logger->debug("--- Frame Processing Complete ---");
         }
+    }
+
+    void laserCloudInfoHandler(const fins::Msg<lio_sam::msg::CloudInfo> &msgIn)
+    {
+        if (isProcessing.load()) {
+            static int drop_count = 0;
+            if (++drop_count % 10 == 0) {
+                logger->warn("Dropping frames, {} frames dropped so far", drop_count);
+            }
+            return;
+        }
+        
+        {
+            std::lock_guard<std::mutex> lock(mtxMapOpt);
+            pendingCloudInfo = *msgIn.data;
+            hasNewTask = true;
+        }
+        
+        cvMapOpt.notify_one();
     }
 
     void gpsHandler(const fins::Msg<nav_msgs::msg::Odometry> &gpsMsg)
@@ -485,7 +552,7 @@ public:
     //     cout << "Saving map to pcd files completed" << endl;
     // }
 
-    void publishGlobalMap(fins::time_stamp ts)
+    void publishGlobalMap(fins::AcqTime ts)
     {
         if (cloudKeyPoses3D->points.empty() == true)
             return;
@@ -536,7 +603,7 @@ public:
         pcl::toROSMsg(*globalMapKeyFramesDS, rosGlobalMap);
         rosGlobalMap.header.stamp = timeLaserInfoStamp;
         rosGlobalMap.header.frame_id = odometryFrame;
-        send<7>(rosGlobalMap, ts);
+        send("global_map", rosGlobalMap, ts);
     }
 
     void loopClosureThread()
@@ -800,7 +867,7 @@ public:
 
         markerArray.markers.push_back(markerNode);
         markerArray.markers.push_back(markerEdge);
-        send<5>(markerArray, fins::now());
+        send("loop_closure", markerArray, fins::now());
     }
 
     void updateInitialGuess()
@@ -1642,7 +1709,7 @@ public:
         globalPath.poses.push_back(pose_stamped);
     }
 
-    void publishOdometry(fins::time_stamp ts)
+    void publishOdometry(fins::AcqTime ts)
     {
         // Publish odometry for ROS (global)
         nav_msgs::msg::Odometry laserOdometryROS;
@@ -1657,15 +1724,19 @@ public:
         geometry_msgs::msg::Quaternion quat_msg;
         tf2::convert(quat_tf, quat_msg);
         laserOdometryROS.pose.pose.orientation = quat_msg;
-        send<0>(laserOdometryROS, ts);
+        send("odom_global", laserOdometryROS, ts);
 
-        tf2::Transform t_odom_to_lidar = tf2::Transform(quat_tf, tf2::Vector3(transformTobeMapped[3], transformTobeMapped[4], transformTobeMapped[5]));
+        // Publish TF: odom → lidar_link
+        tf2::Transform t_odom_to_lidar = tf2::Transform(
+            quat_tf, 
+            tf2::Vector3(transformTobeMapped[3], transformTobeMapped[4], transformTobeMapped[5])
+        );
         tf2::TimePoint time_point = tf2_ros::fromRclcpp(timeLaserInfoStamp);
         tf2::Stamped<tf2::Transform> temp_odom_to_lidar(t_odom_to_lidar, time_point, odometryFrame);
         geometry_msgs::msg::TransformStamped trans_odom_to_lidar;
         tf2::convert(temp_odom_to_lidar, trans_odom_to_lidar);
         trans_odom_to_lidar.child_frame_id = "lidar_link";
-        send<8>(trans_odom_to_lidar, ts);
+        send("tf_odom_to_lidar", trans_odom_to_lidar, ts);
 
         // Publish odometry for ROS (incremental)
         static bool lastIncreOdomPubFlag = false;
@@ -1716,10 +1787,10 @@ public:
             laserOdomIncremental.pose.pose.orientation = quat_msg_inc;
             laserOdomIncremental.pose.covariance[0] = isDegenerate ? 1 : 0;
         }
-        send<1>(laserOdomIncremental, ts);
+        send("odom_incremental", laserOdomIncremental, ts);
     }
 
-    void publishFrames(fins::time_stamp ts)
+    void publishFrames(fins::AcqTime ts)
     {
         if (cloudKeyPoses3D->points.empty())
             return;
@@ -1730,18 +1801,18 @@ public:
         pcl::toROSMsg(*cloudKeyPoses3D, rosCloud);
         rosCloud.header.stamp = timeLaserInfoStamp;
         rosCloud.header.frame_id = odometryFrame;
-        send<2>(rosCloud, ts);
+        send("key_poses", rosCloud, ts);
 
         // Map Local
         pcl::toROSMsg(*laserCloudSurfFromMapDS, rosCloud);
         rosCloud.header.stamp = timeLaserInfoStamp;
         rosCloud.header.frame_id = odometryFrame;
-        send<6>(rosCloud, ts);
+        send("local_map", rosCloud, ts);
 
         // Path
         globalPath.header.stamp = timeLaserInfoStamp;
         globalPath.header.frame_id = odometryFrame;
-        send<3>(globalPath, ts);
+        send("global_path", globalPath, ts);
 
         // cloud_registered
         pcl::PointCloud<PointType>::Ptr cloudOut(new pcl::PointCloud<PointType>());
@@ -1754,7 +1825,7 @@ public:
         rosCloud.header.stamp = timeLaserInfoStamp;
         rosCloud.header.frame_id = odometryFrame;
         
-        send<4>(rosCloud, ts); 
+        send("cloud_registered", rosCloud, ts); 
 
         // Global Map (Optional: Can be slow, typically triggered by timer or specific logic)
         // publishGlobalMap(ts);

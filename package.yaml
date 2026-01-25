@@ -6,5 +6,24 @@ maintainers:
     email: "shant@mit.edu"
   - name: "fins"
     email: "fins@sjtu.edu.cn"
+depends:
+  Eigen3: "3.4.0"
+  Sophus: "1.2.2"
+  OpenMP: "system"
+  
+  std_msgs: "system"
+  sensor_msgs: "system"
+  geometry_msgs: "system"
+  nav_msgs: "system"
+  visualization_msgs: "system"
+  pcl_conversions: "system"
+  tf2: "system"
+  tf2_ros: "system"
+  tf2_geometry_msgs: "system"
+  tf2_eigen: "system"
+
+  PCL: "system"
+  OpenCV: "system"
+  rclcpp: "system"
 licenses:
   - "BSD 3-Clause"
