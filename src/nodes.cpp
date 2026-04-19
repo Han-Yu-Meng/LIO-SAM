@@ -9,4 +9,4 @@
 #include "imageProjection.cpp"
 #include "featureExtraction.cpp"
 
-DEFINE_PLUGIN_ENTRY()
+DEFINE_PLUGIN_ENTRY(fins::STATEFUL)
